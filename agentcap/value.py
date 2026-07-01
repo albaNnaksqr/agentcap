@@ -6,17 +6,23 @@ VALUE of the trajectory as training data, on two deterministic axes:
 
   A. Groundedness (is the success trustworthy / reproducible?)
      A self-authored test that ends green is a REPRODUCIBILITY ANCHOR — not an
-     independent judge, but proof the trajectory didn't just claim success.
+     independent judge, but proof the trajectory didn't just claim success. And it
+     only counts if the ENVIRONMENT the test ran in verifiably reconstructs (from
+     verify.json) — otherwise the "green" isn't reproducible by anyone.
        grounded        : ran tests, observed a failure, ended green
        weakly_grounded : ended green but never observed a failure
+       untrusted       : log looks grounded but env snapshot failed to reconstruct
        ungrounded      : no test / ended red  -> outcome can't be trusted
 
   B. Process richness (how much learning signal — difficulty + failure->recovery)
        rich / moderate / thin, from files changed, edit churn, test iterations,
        red->green transitions, error variety.
 
-value_tier = groundedness_score (0-2) + process_score (0-2), bucketed. All raw
-signals are exposed — the tier is a transparent proxy, not a benchmark grade.
+  C. Focus/coherence — one problem, not sprawl (focused / diffuse / sprawling).
+
+value_tier = groundedness_score (0-2) + process_score (0-2), bucketed, then gated:
+`high` also requires focus==focused AND env_verified=="verified". All raw signals
+are exposed — the tier is a transparent proxy, not a benchmark grade.
 """
 import json
 import os
@@ -59,6 +65,20 @@ def assess(session_dir):
     traj = join["trajectory"]
     log, agent = traj["log_path"], traj.get("agent")
 
+    # env verification state (persisted by `verify-session`). This is the whole point
+    # of a "verifiable" snapshot: a grounded claim only holds if the environment the
+    # tests ran in actually reconstructs. Three states, kept distinct on purpose:
+    #   verified   both snapshots reconstruct hash-for-hash and are consistent
+    #   failed     reconstruction mismatch OR snapshot captured mid-mutation
+    #   unverified verify-session hasn't been run yet (unknown, not a failure)
+    env = _load(os.path.join(session_dir, "verify.json"))
+    if env is None:
+        env_state = "unverified"
+    else:
+        inconsistent = (env.get("start", {}).get("snapshot_inconsistent")
+                        or env.get("end", {}).get("snapshot_inconsistent"))
+        env_state = "verified" if (env.get("verified") and not inconsistent) else "failed"
+
     runs = tooltrace.test_runs(log, agent)
     edits = tooltrace.edit_events(log, agent)
     ftp, _ptp, _ev = taskseed._timeline(runs) if runs else (set(), set(), [])
@@ -84,6 +104,12 @@ def assess(session_dir):
         grounded, gscore = ("grounded", 2)
     else:
         grounded, gscore = ("weakly_grounded", 1)
+
+    # env verification gates the log-derived outcome: if the environment can't be
+    # reconstructed, the "green" isn't reproducible, so the outcome is untrusted —
+    # no matter how clean the log looks.
+    if env_state == "failed" and gscore > 0:
+        grounded, gscore = ("untrusted", 0)
 
     # --- axis B: process richness (CODE surface only) ---
     changed = set(delta["added"]) | set(delta["modified"]) | set(delta["deleted"])
@@ -112,10 +138,10 @@ def assess(session_dir):
     total = gscore + pscore
     if mega:
         tier = "low"                         # a multi-task mega-session isn't one unit
-    elif total >= 3 and not diffuse:
-        tier = "high"                        # grounded + rich + focused
+    elif total >= 3 and not diffuse and env_state == "verified":
+        tier = "high"                        # grounded + rich + focused + env verifies
     elif total >= 2:
-        tier = "medium"
+        tier = "medium"                      # incl. would-be-high w/ unverified/failed env
     else:
         tier = "low"
 
@@ -125,6 +151,7 @@ def assess(session_dir):
         "groundedness": grounded,
         "process_richness": process,
         "focus": focus,
+        "env_verified": env_state,           # verified | failed | unverified
         "signals": {
             "code_files_changed": code_surface,
             "code_clusters": clusters,
@@ -139,7 +166,8 @@ def assess(session_dir):
         "candidate_fail_to_pass": sorted(ftp),   # a sub-signal now, not the headline
         "note": "heuristic value proxy from deterministic trajectory+env signals; "
                 "not a benchmark grade; agent-authored tests count as reproducibility "
-                "anchors; high = grounded + rich + focused (sprawl is demoted)",
+                "anchors; high = grounded + rich + focused + env verified "
+                "(sprawl demoted; unverified/failed env caps at medium)",
     }
     _write(os.path.join(session_dir, "value.json"), val)
     return val

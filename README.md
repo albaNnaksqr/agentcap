@@ -21,13 +21,16 @@ Local, deterministic, no model at runtime.
 
 | axis | question | levels |
 |---|---|---|
-| **groundedness** | is the success trustworthy / reproducible? | grounded · weakly_grounded · ungrounded |
+| **groundedness** | is the success trustworthy / reproducible? | grounded · weakly_grounded · untrusted · ungrounded |
 | **process richness** | difficulty + failure→recovery signal (code files only) | rich · moderate · thin |
 | **focus** | one coherent problem, not sprawl | focused · diffuse · sprawling |
 
-`high = grounded + rich + focused`. All raw signals land in `value.json`; the tier is a
-transparent proxy, not a benchmark grade. An agent-authored test that ends green counts as a
-reproducibility anchor, not an independent oracle.
+`high = grounded + rich + focused + env verified`. The value score consumes the **verification
+result**, not just the log: a session whose env snapshot fails to reconstruct is `untrusted`
+(the "green" isn't reproducible), and a session you haven't verified yet caps at `medium` — so
+"high" always means the environment provably rebuilds. All raw signals land in `value.json`; the
+tier is a transparent proxy, not a benchmark grade. An agent-authored test that ends green counts
+as a reproducibility anchor, not an independent oracle.
 
 ## CLI
 

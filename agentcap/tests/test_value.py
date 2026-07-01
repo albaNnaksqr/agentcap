@@ -1,7 +1,10 @@
-"""Trajectory value test: the two-axis score (groundedness x process richness).
-Covers: a rich grounded session = high; a trivial one-shot = low; an ended-red
-session = ungrounded/low; and that a clean agent-authored TDD success is treated as
-GROUNDED (self-authored test = reproducibility anchor, not a defect).
+"""Trajectory value test: the value score (groundedness x process richness x focus)
+plus the env-verification gate.
+Covers: a rich grounded+verified session = high; a trivial one-shot = low; an
+ended-red session = ungrounded/low; a clean agent-authored TDD success = GROUNDED
+(self-authored test = reproducibility anchor, not a defect); cross-cluster sprawl =
+diffuse; a broken env snapshot = untrusted (demoted); an unverified env = capped at
+medium (honest 'unknown', not high).
 Run with:  python3 -m agentcap.tests.test_value
 """
 import json
@@ -69,6 +72,9 @@ def build(tmp, name, files_at_start, end_edits, events):
     J.set_join(sid, {"agent": "claude", "session_id": "S", "cwd": repo, "log_path": log,
                      "first_ts": 0, "last_ts": 0, "n_steps": len(events)},
                confidence="high", root=store)
+    # verify the env so `high` is reachable — a grounded claim only counts when the
+    # environment reconstructs (writes verify.json that value.assess reads).
+    sess.verify_session(sid, root=store)
     _, sdir = sess._paths(store)
     return os.path.join(sdir, sid)
 
@@ -142,6 +148,48 @@ def main():
         fails.append("docs should be excluded from code clusters")
     else:
         print("[ok] cross-cluster sprawl -> diffuse, demoted from high; docs excluded")
+
+    # ENV FAILED: same grounded+rich+focused trajectory, but the env snapshot doesn't
+    # reconstruct -> the "green" isn't reproducible, so outcome is untrusted, not high.
+    ef = build(tmp, "envfail",
+               files_at_start={"src/a.py": "v=0\n", "src/b.py": "w=0\n",
+                               "tests/test_a.py": "def test_x():\n    assert 1\n"},
+               end_edits={"src/a.py": "v=1\n", "src/b.py": "w=1\n"},
+               events=[("bash", "python -m pytest -q", RED),
+                       ("edit", "src/a.py", None), ("edit", "src/b.py", None),
+                       ("bash", "python -m pytest -q", GREEN)])
+    vj = json.load(open(os.path.join(ef, "verify.json")))
+    vj["verified"] = False                    # simulate a reconstruction mismatch
+    with open(os.path.join(ef, "verify.json"), "w") as f:
+        json.dump(vj, f)
+    v5 = V.assess(ef)
+    if not v5 or v5["env_verified"] != "failed":
+        fails.append("broken env should be env_verified=failed: %s" % (v5 and v5.get("env_verified")))
+    elif v5["groundedness"] != "untrusted":
+        fails.append("failed-env outcome should be untrusted: %s" % v5["groundedness"])
+    elif v5["value_tier"] == "high":
+        fails.append("failed-env session must not be high: %s" % v5["value_tier"])
+    else:
+        print("[ok] env reconstruction failed -> untrusted, demoted from high")
+
+    # ENV UNVERIFIED: verify never run -> honest 'unknown', capped at medium not high.
+    uv = build(tmp, "unverified",
+               files_at_start={"src/a.py": "v=0\n", "src/b.py": "w=0\n",
+                               "tests/test_a.py": "def test_x():\n    assert 1\n"},
+               end_edits={"src/a.py": "v=1\n", "src/b.py": "w=1\n"},
+               events=[("bash", "python -m pytest -q", RED),
+                       ("edit", "src/a.py", None), ("edit", "src/b.py", None),
+                       ("bash", "python -m pytest -q", GREEN)])
+    os.remove(os.path.join(uv, "verify.json"))   # pretend verify-session never ran
+    v6 = V.assess(uv)
+    if not v6 or v6["env_verified"] != "unverified":
+        fails.append("no verify.json should be env_verified=unverified: %s" % (v6 and v6.get("env_verified")))
+    elif v6["groundedness"] != "grounded":
+        fails.append("unverified env keeps log-grounded label: %s" % v6["groundedness"])
+    elif v6["value_tier"] != "medium":
+        fails.append("unverified env should cap at medium, not high: %s" % v6["value_tier"])
+    else:
+        print("[ok] env unverified -> grounded label kept but capped at medium")
 
     print("-" * 50)
     if fails:

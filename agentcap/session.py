@@ -155,7 +155,7 @@ def verify_session(session_id, root=DEFAULT_ROOT):
         and session["end_confidence"] == "high"
         and join_conf == "high"          # v0.2: a benchmark unit needs a high-confidence join
     )
-    return {
+    report = {
         "session_id": session_id,
         "start": rep_s,
         "end": rep_e,
@@ -163,3 +163,6 @@ def verify_session(session_id, root=DEFAULT_ROOT):
         "verified": ok_s and ok_e,
         "benchmark_eligible": eligible,
     }
+    # persist so `value` can consume the verification result without re-reconstructing
+    _write_json(os.path.join(sdir, "verify.json"), report)
+    return report
