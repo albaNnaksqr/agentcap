@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agentcap watcher (macOS launchd). Install:
+       sed "s#__PYTHON__#$(which python3)#; s#__REPO__#$HOME/workspace/trace2env#" \
+         agentcap/deploy/com.agentcap.watcher.plist.template \
+         > ~/Library/LaunchAgents/com.agentcap.watcher.plist
+       launchctl load ~/Library/LaunchAgents/com.agentcap.watcher.plist
+     RunAtLoad + KeepAlive give crash/reboot recovery; the watcher's own periodic
+     reconciliation (v0.2) covers sleep and missed FS events, so a plain poll loop
+     is enough — no FSEvents dependency. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.agentcap.watcher</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>-m</string><string>agentcap</string>
+    <string>watch</string>
+    <string>--interval</string><string>60</string>
+  </array>
+  <key>WorkingDirectory</key><string>__REPO__</string>
+  <key>EnvironmentVariables</key>
+  <dict><key>PYTHONPATH</key><string>__REPO__</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/tmp/agentcap.watcher.log</string>
+  <key>StandardErrorPath</key><string>/tmp/agentcap.watcher.err</string>
+</dict>
+</plist>
