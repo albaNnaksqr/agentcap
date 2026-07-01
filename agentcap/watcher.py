@@ -7,6 +7,16 @@ snapshot may lag the first agent edit), so they are NOT benchmark-eligible unles
 hook later upgrades them. Reconciliation is keyed by the agent's own session_id, so
 two concurrent sessions in the same repo don't collide.
 
+env_start FIDELITY depends on poll cadence: the watcher can only snapshot env_start
+once it first *sees* the session's log (which appears after the agent starts), so the
+start snapshot is faithful only when `interval + grace < the agent's first-edit
+latency`. For interactive Claude Code / Codex sessions (minutes long) the default
+60s/5s is comfortably safe. But a sub-minute headless run (e.g. `codex exec` solving a
+toy task in ~30s) can finish editing before the first poll — env_start then captures
+the ALREADY-CHANGED tree and the delta collapses to empty. If you need to capture such
+fast sessions, tighten `interval`/`GRACE_SECS` below the first-edit latency, or pin the
+boundary explicitly with mark-start/mark-end (the high-confidence path).
+
 `reconcile()` is a pure decision function (observed + open state + now -> to_start /
 to_end), testable without a daemon. `tick()` executes those decisions; `watch()`
 loops via periodic reconciliation (survives sleep/crash/missed FS events).
@@ -40,31 +50,39 @@ def _safe_id(agent, session_id):
     return "%s-%s" % (agent, session_id.replace("/", "_"))
 
 
-def reconcile(observed, open_sessions, now, idle_secs=IDLE_SECS, grace_secs=GRACE_SECS):
-    """Pure decision. open_sessions: list of agentcap session dicts (status=open).
-    Returns (to_start, to_end).
-      to_start: observed entries that are git repos, fresh, and not already open.
-      to_end:   open agentcap sessions whose agent log is idle or gone."""
-    open_by_agent = {}
-    for s in open_sessions:
+def reconcile(observed, sessions, now, idle_secs=IDLE_SECS, grace_secs=GRACE_SECS):
+    """Pure decision. sessions: list of agentcap session dicts (any status).
+    Returns (to_start, to_end, to_reopen).
+      to_start:  observed git repos, fresh, with no agentcap session yet.
+      to_reopen: observed git repos, fresh, whose agentcap session is CLOSED — the
+                 agent resumed after an idle close, so continue the same session.
+      to_end:    OPEN agentcap sessions whose agent log is idle or gone."""
+    by_agent, open_by_agent = {}, {}
+    for s in sessions:
         aid = s.get("extra", {}).get("agent_session_id")
-        if aid:
-            open_by_agent[(s["agent"], aid)] = s
+        if not aid:
+            continue
+        key = (s["agent"], aid)
+        by_agent[key] = s
+        if s["status"] == "open":
+            open_by_agent[key] = s
 
-    seen_keys = set()
-    to_start = []
+    to_start, to_reopen = [], []
     for o in observed:
         if not o["is_git"]:
             continue
         key = (o["agent"], o["session_id"])
-        seen_keys.add(key)
         if key in open_by_agent:
             continue
         if now - o["mtime"] < grace_secs:      # still being created
             continue
-        if now - o["mtime"] >= idle_secs:      # already stale on first sight -> skip open
+        if now - o["mtime"] >= idle_secs:      # stale -> neither open nor resume
             continue
-        to_start.append(o)
+        existing = by_agent.get(key)
+        if existing is None:
+            to_start.append(o)                 # brand new session
+        elif existing["status"] == "closed":
+            to_reopen.append(existing)         # resumed after an idle close
 
     to_end = []
     for (agent, aid), s in open_by_agent.items():
@@ -74,16 +92,16 @@ def reconcile(observed, open_sessions, now, idle_secs=IDLE_SECS, grace_secs=GRAC
             to_end.append(s)
         elif now - o["mtime"] >= idle_secs:     # gone idle
             to_end.append(s)
-    return to_start, to_end
+    return to_start, to_end, to_reopen
 
 
 def tick(adapter_list=None, root=sess.DEFAULT_ROOT, idle_secs=IDLE_SECS, now=None):
     now = now if now is not None else time.time()
     observed = observe(adapter_list)
-    open_sessions = sess.list_sessions(root, status="open")
-    to_start, to_end = reconcile(observed, open_sessions, now, idle_secs)
+    all_sessions = sess.list_sessions(root)
+    to_start, to_end, to_reopen = reconcile(observed, all_sessions, now, idle_secs)
 
-    started, ended = [], []
+    started, ended, reopened = [], [], []
     for o in to_start:
         sid = _safe_id(o["agent"], o["session_id"])
         try:
@@ -94,19 +112,22 @@ def tick(adapter_list=None, root=sess.DEFAULT_ROOT, idle_secs=IDLE_SECS, now=Non
             started.append(sid)
         except RuntimeError:
             pass  # already exists (raced) -> skip
+    for s in to_reopen:
+        sess.reopen_session(session_id=s["session_id"], root=root)
+        reopened.append(s["session_id"])
     for s in to_end:
         sess.end_session(session_id=s["session_id"], confidence="best-effort", root=root)
         ended.append(s["session_id"])
-    return started, ended
+    return started, ended, reopened
 
 
 def watch(adapter_list=None, root=sess.DEFAULT_ROOT, interval=60, idle_secs=IDLE_SECS):
     while True:
         try:
-            started, ended = tick(adapter_list, root, idle_secs)
-            if started or ended:
-                print("[agentcap] +%d started, -%d ended" % (len(started), len(ended)),
-                      flush=True)
+            started, ended, reopened = tick(adapter_list, root, idle_secs)
+            if started or ended or reopened:
+                print("[agentcap] +%d started, -%d ended, ~%d reopened"
+                      % (len(started), len(ended), len(reopened)), flush=True)
         except Exception as e:  # a watcher must never die on one bad tick
             print("[agentcap] tick error: %s" % e, flush=True)
         time.sleep(interval)

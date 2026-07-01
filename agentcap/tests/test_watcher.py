@@ -1,5 +1,6 @@
-"""Watcher test (step 4): reconciliation decisions + a full open->idle->close tick
-cycle against fake Claude session dirs. Run with
+"""Watcher test (step 4): reconciliation decisions + a full open->idle->close cycle,
+plus resume-after-idle reopen (an idle-closed session whose log is written again is
+reopened in place, not forked into a new session). Run with
     python3 -m agentcap.tests.test_watcher
 """
 import json
@@ -59,7 +60,7 @@ def main():
         {"agent": "claude", "session_id": "s3", "cwd": repo, "log_path": "/z",
          "mtime": now - 1, "is_git": True},   # within grace -> skip
     ]
-    to_start, to_end = W.reconcile(observed, [], now)
+    to_start, to_end, to_reopen = W.reconcile(observed, [], now)
     starts = {o["session_id"] for o in to_start}
     if starts != {"s1"}:
         fails.append("reconcile start set wrong: %s (want {s1})" % starts)
@@ -69,7 +70,7 @@ def main():
     # --- full tick cycle: open, then idle -> close ---
     log = fake_claude_log(projects, "abc123", repo, mtime=now - 60)
     ad = [ClaudeAdapter(root=projects)]
-    started, ended = W.tick(ad, root=store, now=now)
+    started, ended, reopened = W.tick(ad, root=store, now=now)
     if started != ["claude-abc123"]:
         fails.append("tick did not open expected session: %s" % started)
     opened = sess.list_sessions(store, status="open")
@@ -79,21 +80,46 @@ def main():
         print("[ok] tick opened a best-effort session (not benchmark-eligible)")
 
     # second tick, still fresh -> no change (idempotent)
-    started2, ended2 = W.tick(ad, root=store, now=now + 10)
-    if started2 or ended2:
-        fails.append("tick not idempotent while active: +%s -%s" % (started2, ended2))
+    started2, ended2, reopened2 = W.tick(ad, root=store, now=now + 10)
+    if started2 or ended2 or reopened2:
+        fails.append("tick not idempotent while active: +%s -%s ~%s" % (started2, ended2, reopened2))
     else:
         print("[ok] tick idempotent while session active")
 
     # age the log past idle -> tick closes it
     os.utime(log, (now - 10000, now - 10000))
-    started3, ended3 = W.tick(ad, root=store, now=now, idle_secs=600)
+    started3, ended3, reopened3 = W.tick(ad, root=store, now=now, idle_secs=600)
     if ended3 != ["claude-abc123"]:
         fails.append("idle session not closed: %s" % ended3)
     elif sess.list_sessions(store, status="open"):
         fails.append("session still open after idle close")
     else:
         print("[ok] idle log -> session closed, delta computed")
+
+    # the agent RESUMES: same log written again -> reopen, not a new session
+    with open(log, "a") as f:
+        f.write(json.dumps({"type": "user", "cwd": repo}) + "\n")
+    os.utime(log, (now - 60, now - 60))          # fresh again
+    started4, ended4, reopened4 = W.tick(ad, root=store, now=now, idle_secs=600)
+    if reopened4 != ["claude-abc123"]:
+        fails.append("resumed session not reopened: ~%s" % reopened4)
+    elif started4:
+        fails.append("resume must reopen, not create a new session: +%s" % started4)
+    reopened_open = sess.list_sessions(store, status="open")
+    if len(sess.list_sessions(store)) != 1:
+        fails.append("reopen must not fork a second session: %d total" % len(sess.list_sessions(store)))
+    elif len(reopened_open) != 1 or reopened_open[0].get("reopens") != 1:
+        fails.append("reopened session should be open with reopens=1: %s" % reopened_open)
+    else:
+        print("[ok] idle-closed session resumes -> reopened in place (reopens=1)")
+
+    # resumed session goes idle again -> closes again, delta recomputed vs original start
+    os.utime(log, (now - 10000, now - 10000))
+    W.tick(ad, root=store, now=now, idle_secs=600)
+    if sess.list_sessions(store, status="open"):
+        fails.append("reopened session did not re-close on idle")
+    else:
+        print("[ok] reopened session re-closes on idle (span preserved)")
 
     print("-" * 50)
     if fails:

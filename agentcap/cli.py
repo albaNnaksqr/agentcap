@@ -82,8 +82,8 @@ def main(argv=None):
         sys.exit(0 if rep["verified"] else 1)
     elif a.cmd == "tick":
         from . import watcher
-        started, ended = watcher.tick(root=a.root)
-        print(json.dumps({"started": started, "ended": ended}, indent=2))
+        started, ended, reopened = watcher.tick(root=a.root)
+        print(json.dumps({"started": started, "ended": ended, "reopened": reopened}, indent=2))
     elif a.cmd == "watch":
         from . import watcher
         watcher.watch(root=a.root, interval=a.interval)

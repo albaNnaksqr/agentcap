@@ -136,6 +136,26 @@ def end_session(session_id=None, repo=None, confidence="high", root=DEFAULT_ROOT
     return session, delta
 
 
+def reopen_session(session_id, root=DEFAULT_ROOT):
+    """Resume a session the watcher closed prematurely: the agent went idle past the
+    threshold, then wrote to the same log again. We keep the original env_start and
+    flip the session back to open; env_end + delta are recomputed against that start
+    when it finally closes, so the captured delta spans the whole session (the mid-idle
+    close is undone). `reopens` records how many idle gaps the session survived."""
+    _, sessions = _paths(root)
+    sj = os.path.join(sessions, session_id, "session.json")
+    session = json.load(open(sj))
+    if session["status"] == "open":
+        return session
+    session["status"] = "open"
+    session["closed_at"] = None
+    session["end_confidence"] = None
+    session["base_sha_end"] = None
+    session["reopens"] = session.get("reopens", 0) + 1
+    _write_json(sj, session)
+    return session
+
+
 def verify_session(session_id, root=DEFAULT_ROOT):
     """Verify both env snapshots reconstruct + report benchmark eligibility for the pair."""
     _, sessions = _paths(root)
