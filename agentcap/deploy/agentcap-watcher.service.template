@@ -1,0 +1,23 @@
+# agentcap watcher (Linux systemd user unit). Install:
+#   sed "s#__PYTHON__#$(which python3)#; s#__REPO__#$HOME/workspace/agentcap#" \
+#     agentcap/deploy/agentcap-watcher.service.template \
+#     > ~/.config/systemd/user/agentcap-watcher.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now agentcap-watcher
+#   loginctl enable-linger $USER     # keep it running after logout
+# Restart=always + the watcher's own periodic reconciliation (v0.2) cover crashes,
+# reboots, sleep, and missed FS events — a plain poll loop is enough, no inotify.
+[Unit]
+Description=agentcap watcher — best-effort coding-agent session collector
+
+[Service]
+Type=simple
+WorkingDirectory=__REPO__
+Environment=PYTHONPATH=__REPO__
+ExecStart=__PYTHON__ -m agentcap watch --interval 60
+Restart=always
+RestartSec=30
+Nice=10
+
+[Install]
+WantedBy=default.target
