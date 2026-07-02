@@ -22,6 +22,10 @@ Local, deterministic, no model at runtime.
 
 ## Value score (3 deterministic axes)
 
+Test runs are recognized across frameworks (pytest / unittest / go test / cargo test /
+jest / vitest / mocha and npm-style runners), node-level where the framework prints it,
+counts-only otherwise.
+
 | axis | question | levels |
 |---|---|---|
 | **groundedness** | is the success trustworthy / reproducible? | grounded · weakly_grounded · untrusted · ungrounded |

@@ -11,35 +11,21 @@ Method (see the method write-up):
 """
 import json
 import os
-import re
 
 from . import session as sess
+from . import testparse
 from . import tooltrace
 from .snapshot import load_manifest
 
-# pytest node results
-_FAILED = re.compile(r'^(?:FAILED|ERROR)\s+(\S+::\S+)', re.M)          # -q summary + verbose
-_FAILED_V = re.compile(r'^(\S+::\S+)\s+(?:FAILED|ERROR)\b', re.M)      # verbose "node FAILED"
-_PASSED_V = re.compile(r'^(\S+::\S+)\s+PASSED\b', re.M)                # verbose only
-_PASSED_V2 = re.compile(r'^PASSED\s+(\S+::\S+)', re.M)
-_COUNTS = re.compile(r'(\d+)\s+(passed|failed|error|errors|skipped)')
-
-
-def parse_pytest(output):
-    failed = set(_FAILED.findall(output)) | set(_FAILED_V.findall(output))
-    passed = set(_PASSED_V.findall(output)) | set(_PASSED_V2.findall(output))
-    passed -= failed
-    counts = {}
-    for n, kind in _COUNTS.findall(output):
-        counts[kind.rstrip("s")] = counts.get(kind.rstrip("s"), 0) + int(n)
-    return {"failed": failed, "passed": passed, "counts": counts}
+# parsing lives in testparse now (framework-aware); kept as a name for callers/tests
+parse_pytest = testparse.parse_pytest
 
 
 def _timeline(runs):
     """runs sorted by time. Return (candidate_ftp, candidate_ptp, evidence)."""
     parsed = []
     for r in sorted(runs, key=lambda r: (r.get("ts") or "", r["idx"])):
-        p = parse_pytest(r["output"])
+        p = testparse.parse(r["output"], r.get("framework"))
         parsed.append((r, p))
     if not parsed:
         return set(), set(), []

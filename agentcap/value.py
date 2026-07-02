@@ -28,6 +28,7 @@ import json
 import os
 import re
 
+from . import testparse
 from . import tooltrace
 from . import taskseed
 from .snapshot import load_manifest  # noqa: F401 (kept for parity / future grounding)
@@ -83,7 +84,7 @@ def assess(session_dir):
     edits = tooltrace.edit_events(log, agent)
     ftp, _ptp, _ev = taskseed._timeline(runs) if runs else (set(), set(), [])
 
-    parsed = [taskseed.parse_pytest(r["output"]) for r in
+    parsed = [testparse.parse(r["output"], r.get("framework")) for r in
               sorted(runs, key=lambda r: (r.get("ts") or "", r["idx"]))]
     errors = set()
     for r in runs:
@@ -158,6 +159,7 @@ def assess(session_dir):
             "edit_events": edit_count,
             "file_rechurn": rechurn,
             "test_iterations": test_iters,
+            "frameworks": sorted({r.get("framework") for r in runs if r.get("framework")}),
             "red_green_transitions": transitions,
             "error_types": sorted(errors),
             "observed_failure": had_failure,

@@ -6,9 +6,12 @@ trajectory log. Per-agent shapes, verified against real logs:
   Codex:  response_item.payload -> function_call{arguments(JSON: cmd), call_id}
           paired with function_call_output{call_id, output}
 
-We only surface runs whose command looks like a test invocation. If a log can't
-be parsed, it yields nothing (no event beats a wrong event)."""
+We only surface runs whose command a known test framework claims (testparse) —
+each run carries its framework tag. If a log can't be parsed, it yields nothing
+(no event beats a wrong event)."""
 import json
+
+from . import testparse
 
 
 def _text(content):
@@ -27,7 +30,7 @@ def _text(content):
 
 
 def _is_test_cmd(cmd):
-    return bool(cmd) and "pytest" in cmd
+    return testparse.detect_framework(cmd) is not None
 
 
 def claude_runs(path):
@@ -84,9 +87,11 @@ def _pair(calls, outputs, order):
     runs = []
     for i, cid in enumerate(order):
         cmd, ts = calls.get(cid, (None, None))
-        if not _is_test_cmd(cmd):
+        fw = testparse.detect_framework(cmd)
+        if fw is None:
             continue
-        runs.append({"cmd": cmd, "output": outputs.get(cid, ""), "ts": ts, "idx": i})
+        runs.append({"cmd": cmd, "output": outputs.get(cid, ""), "ts": ts, "idx": i,
+                     "framework": fw})
     return runs
 
 
