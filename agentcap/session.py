@@ -109,7 +109,8 @@ def _delta(start_dir, end_dir):
     return {"added": added, "modified": modified, "deleted": deleted}
 
 
-def end_session(session_id=None, repo=None, confidence="high", root=DEFAULT_ROOT):
+def end_session(session_id=None, repo=None, confidence="high", root=DEFAULT_ROOT,
+                auto_verify=True):
     _, sessions = _paths(root)
     if session_id is None:
         if repo is None:
@@ -133,6 +134,15 @@ def end_session(session_id=None, repo=None, confidence="high", root=DEFAULT_ROOT
     session["closed_at"] = _now()
     session["base_sha_end"] = meta["base_sha"]
     _write_json(sj, session)
+
+    # verify NOW, while base_sha is still reachable — a later rebase/gc makes the
+    # capture permanently unverifiable, so the close-time report banks the result.
+    # Best-effort: a verify failure must never make close fail (watcher path).
+    if auto_verify:
+        try:
+            verify_session(session_id, root=root)
+        except Exception:
+            pass
     return session, delta
 
 
@@ -153,6 +163,10 @@ def reopen_session(session_id, root=DEFAULT_ROOT):
     session["base_sha_end"] = None
     session["reopens"] = session.get("reopens", 0) + 1
     _write_json(sj, session)
+    # the persisted verification talks about an env_end this reopen supersedes
+    vj = os.path.join(sessions, session_id, "verify.json")
+    if os.path.exists(vj):
+        os.remove(vj)
     return session
 
 
@@ -160,29 +174,44 @@ def verify_session(session_id, root=DEFAULT_ROOT):
     """Verify both env snapshots reconstruct + report benchmark eligibility for the pair."""
     _, sessions = _paths(root)
     sdir = os.path.join(sessions, session_id)
-    session = json.load(open(sdir + "/session.json")) if False else json.load(
-        open(os.path.join(sdir, "session.json")))
+    session = json.load(open(os.path.join(sdir, "session.json")))
     repo, blobs = session["repo"], session["cas_root"]
     ok_s, rep_s = verify_capture(os.path.join(sdir, "env_start"), repo, cas_root=blobs)
     ok_e, rep_e = verify_capture(os.path.join(sdir, "env_end"), repo, cas_root=blobs)
 
-    join_path = os.path.join(sdir, "join.json")
-    join_conf = json.load(open(join_path))["join_confidence"] if os.path.exists(join_path) else None
-
-    eligible = (
-        rep_s["benchmark_eligible"] and rep_e["benchmark_eligible"]
-        and session["start_confidence"] == "high"
-        and session["end_confidence"] == "high"
-        and join_conf == "high"          # v0.2: a benchmark unit needs a high-confidence join
-    )
     report = {
         "session_id": session_id,
         "start": rep_s,
         "end": rep_e,
-        "join_confidence": join_conf,
+        "join_confidence": None,
         "verified": ok_s and ok_e,
-        "benchmark_eligible": eligible,
+        "benchmark_eligible": False,
     }
     # persist so `value` can consume the verification result without re-reconstructing
     _write_json(os.path.join(sdir, "verify.json"), report)
+    return refresh_eligibility(session_id, root=root)
+
+
+def refresh_eligibility(session_id, root=DEFAULT_ROOT):
+    """Recompute benchmark eligibility in a persisted verify.json — cheap (no
+    reconstruction). Sessions auto-verify at close, usually before any join exists;
+    when the join lands later this folds it into the banked report."""
+    _, sessions = _paths(root)
+    sdir = os.path.join(sessions, session_id)
+    vp = os.path.join(sdir, "verify.json")
+    if not os.path.exists(vp):
+        return None
+    report = json.load(open(vp))
+    session = json.load(open(os.path.join(sdir, "session.json")))
+    jp = os.path.join(sdir, "join.json")
+    join_conf = json.load(open(jp))["join_confidence"] if os.path.exists(jp) else None
+
+    report["join_confidence"] = join_conf
+    report["benchmark_eligible"] = (
+        report["start"]["benchmark_eligible"] and report["end"]["benchmark_eligible"]
+        and session["start_confidence"] == "high"
+        and session["end_confidence"] == "high"
+        and join_conf == "high"          # v0.2: a benchmark unit needs a high-confidence join
+    )
+    _write_json(vp, report)
     return report

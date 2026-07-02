@@ -46,8 +46,8 @@ watch → snapshot → verify → join → value
 
 agentcap watch                    # background daemon (launchd template in agentcap/deploy/)
 agentcap mark-start <repo>        # or pin a session manually
-agentcap mark-end --repo <repo>
-agentcap verify-session <id>      # reconstruct both snapshots + hash-check
+agentcap mark-end --repo <repo>   # closing auto-verifies while base_sha is alive
+agentcap verify-session <id>      # re-run reconstruction + hash-check manually
 agentcap join                     # pair trajectories (with confidence)
 agentcap value                    # score every session -> value.json
 agentcap seed                     # candidate red->green signals (neutral sub-signal)

@@ -87,6 +87,7 @@ def join_all(source, root=sess.DEFAULT_ROOT):
         results[s["session_id"]] = j
         if j is not None:
             _write(os.path.join(sessions_dir, s["session_id"], "join.json"), j)
+            sess.refresh_eligibility(s["session_id"], root=root)
     return results
 
 
@@ -98,6 +99,7 @@ def set_join(session_id, trajectory, confidence="high", signals=None,
          "signals": signals or ["manual"],
          "trajectory": trajectory}
     _write(os.path.join(sessions_dir, session_id, "join.json"), j)
+    sess.refresh_eligibility(session_id, root=root)
     return j
 
 
