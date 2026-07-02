@@ -42,7 +42,7 @@ as a reproducibility anchor, not an independent oracle.
 ## CLI
 
 ```
-watch → snapshot → verify → join → value
+watch → snapshot → verify → join → value → export
 
 agentcap watch                    # background daemon (launchd template in agentcap/deploy/)
 agentcap mark-start <repo>        # or pin a session manually
@@ -51,10 +51,27 @@ agentcap verify-session <id>      # re-run reconstruction + hash-check manually
 agentcap join                     # pair trajectories (with confidence)
 agentcap value                    # score every session -> value.json
 agentcap seed                     # candidate red->green signals (neutral sub-signal)
+agentcap export <dir>             # canonical records + RL task instances (see below)
 ```
+
+## Export
+
+`export` writes one self-contained dir per session (tier-gated, default ≥ medium):
+a canonical `record.json` (all provenance travels with the data), the normalized
+`trajectory.jsonl` (claude/codex → one step schema, absolute paths sanitized), an
+`env/` that reconstructs **without the original repo** (git bundle + snapshot
+materials + referenced blobs), and — when a task seed exists — `task.json`: an RL
+task instance with the problem statement, FAIL_TO_PASS / PASS_TO_PASS + observed
+test commands as the verifier spec, and the captured trajectory embedded as
+`reference` (the chosen side of a future DPO pair; `task_key` clusters sessions
+that solve the same tests). Secret hits (key patterns, dotenv files) quarantine
+the whole session — reported, never silently cleaned. Bundle history is not
+scanned: exporting a repo means you own its history.
 
 ## Scope
 
 Captures git-normalized working-tree content + a dependency **declaration** (lockfile) — not a
 runnable runtime. Not a sandbox builder or verifier factory. The watcher is a best-effort
-collector, not a correctness boundary. No publish path yet.
+collector, not a correctness boundary. `export` is the publish path: it packages evidence
+and task instances for downstream consumers (SFT compilers, RL gyms, DPO re-rollouts) —
+containerized replay stays downstream.

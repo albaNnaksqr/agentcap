@@ -61,6 +61,11 @@ def main(argv=None):
     vl = sub.add_parser("value", help="score trajectory value (groundedness x process richness)")
     vl.add_argument("--root", default=sess.DEFAULT_ROOT)
 
+    ex = sub.add_parser("export", help="export canonical records + RL task instances")
+    ex.add_argument("out", help="destination directory")
+    ex.add_argument("--root", default=sess.DEFAULT_ROOT)
+    ex.add_argument("--min-tier", default="medium", choices=["low", "medium", "high"])
+
     a = ap.parse_args(argv)
     if a.cmd == "snapshot":
         meta, manifest = snapshot(a.repo, a.capture_dir, cas_root=a.cas)
@@ -121,6 +126,10 @@ def main(argv=None):
                 summary["no_value"] += 1
             else:
                 summary[v["value_tier"]] += 1
+        print(json.dumps(summary, indent=2))
+    elif a.cmd == "export":
+        from . import export as E
+        summary = E.export_all(root=a.root, out=a.out, min_tier=a.min_tier)
         print(json.dumps(summary, indent=2))
 
 
