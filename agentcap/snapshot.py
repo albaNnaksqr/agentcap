@@ -13,6 +13,7 @@ import os
 import stat
 
 from . import gitutil as g
+from . import runtime
 from .cas import CAS
 
 MANIFEST_VERSION = 1
@@ -88,6 +89,14 @@ def snapshot(repo, capture_dir, cas_root=None):
 
     _write_json(os.path.join(capture_dir, "manifest.json"),
                 {"meta": meta, "entries": manifest})
+
+    # runtime evidence sidecar (L1): best-effort, never gates verify/value and never
+    # fails the capture — the watcher must stay a collector, not a correctness boundary
+    try:
+        rt = runtime.collect(repo)
+    except Exception as e:
+        rt = {"runtime_version": runtime.RUNTIME_VERSION, "error": str(e)}
+    _write_json(os.path.join(capture_dir, "runtime.json"), rt)
     return meta, manifest
 
 

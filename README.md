@@ -16,6 +16,9 @@ Local, deterministic, no model at runtime.
   tampering is detected, not assumed away).
 - **Trajectory join** — pairs the agent's conversation/tool stream to the env capture with a
   *confidence* (session_id / cwd / time-overlap), not a boolean.
+- **Runtime evidence** (`runtime.json` per snapshot) — platform, dependency-declaration
+  file hashes, toolchain versions. Facts for a later rebuild, not a gate: agentcap
+  records the runtime, it does not build one.
 
 ## Value score (3 deterministic axes)
 
