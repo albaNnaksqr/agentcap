@@ -27,6 +27,9 @@ def make_repo(root):
     write(root, "kept.py", "print('base')\n")
     write(root, "sub/mod.py", "X = 1\n")
     write(root, "readme.md", "hello\n")
+    # non-ASCII path: git quotes these in porcelain output (core.quotepath=true) —
+    # a real watcher tick crashed on exactly this shape
+    write(root, "入库字段设计.md", "汉字 tracked\n")
     git(root, "add", "-A")
     git(root, "commit", "-qm", "base")
 
@@ -39,6 +42,7 @@ def make_repo(root):
     os.remove(os.path.join(root, "readme.md"))       # deletion
     git(root, "commit", "-qm", "local unpushed commit", "-a") if False else None
     write(root, "new_untracked.txt", "fresh untracked content\n")  # untracked
+    write(root, "数据/说明 v2.md", "untracked, non-ASCII dir + space\n")
     os.symlink("kept.py", os.path.join(root, "link_to_kept"))       # symlink
 
 
@@ -86,8 +90,13 @@ def main():
         fails.append("untracked file not flagged untracked")
     if "readme.md" not in meta["deleted"]:
         fails.append("deletion not recorded in meta.deleted")
+    if "入库字段设计.md" not in by:
+        fails.append("non-ASCII tracked path missing/quoted in manifest: %s"
+                     % [p for p in by if "md" in p])
+    if not by.get("数据/说明 v2.md", {}).get("untracked"):
+        fails.append("non-ASCII untracked path missing: %s" % sorted(by))
     if not fails:
-        print("[ok] symlink + untracked-flag + deletion recorded")
+        print("[ok] symlink + untracked-flag + deletion + non-ASCII paths recorded")
 
     # 4. TAMPER: corrupt an untracked blob in the CAS -> verify must FAIL
     oid = by["new_untracked.txt"]["content_hash"]

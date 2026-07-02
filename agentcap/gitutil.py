@@ -51,21 +51,26 @@ def hash_bytes(repo, data):
     return p.stdout.decode().strip()
 
 
+def _zlist(repo, *args):
+    """ls-files and friends, NUL-separated: -z is the only mode where git does NOT
+    C-quote non-ASCII paths (core.quotepath), so 入库.md comes back as itself."""
+    return [p for p in out(repo, *args, "-z").split("\0") if p]
+
+
 def tracked_present(repo):
     """Tracked files that currently exist in the worktree (ls-files minus deleted)."""
-    files = set(out(repo, "ls-files").splitlines())
-    deleted = set(out(repo, "ls-files", "-d").splitlines())
+    files = set(_zlist(repo, "ls-files"))
+    deleted = set(_zlist(repo, "ls-files", "-d"))
     return sorted(files - deleted)
 
 
 def deleted_tracked(repo):
-    return sorted(out(repo, "ls-files", "-d").splitlines())
+    return sorted(_zlist(repo, "ls-files", "-d"))
 
 
 def untracked(repo):
     """Untracked, respecting .gitignore. -z for path safety (spaces/newlines)."""
-    o = out(repo, "ls-files", "--others", "--exclude-standard", "-z")
-    return sorted(p for p in o.split("\0") if p)
+    return sorted(_zlist(repo, "ls-files", "--others", "--exclude-standard"))
 
 
 def diff(repo, *extra):
