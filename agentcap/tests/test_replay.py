@@ -108,6 +108,19 @@ def main():
     else:
         print("[ok] S4 setup_failed: infrastructure failure graded, error recorded")
 
+    # --- S5 TDD: fail_to_pass test authored mid-session, absent at base ---
+    files_tdd = {"mod.py": MOD_RED}          # no test file at start
+    edits_tdd = {"mod.py": MOD_GREEN, "tests/test_mod.py": TEST_F}
+    _, _, _, sdir5 = seeded(tmp, "tdd", files_tdd, edits_tdd)
+    rep5 = R.replay_session(sdir5, python=py)
+    if rep5["outcome"] != "red_green" or not rep5["verified"]:
+        fails.append("S5 TDD overlay should verify: %s / %s"
+                     % (rep5["outcome"], rep5.get("error")))
+    elif "tests/test_mod.py" not in rep5["overlaid_test_files"]:
+        fails.append("S5 test file not overlaid: %s" % rep5["overlaid_test_files"])
+    else:
+        print("[ok] S5 TDD: end-authored test overlaid onto base, red verified")
+
     # --- replay_all: batch shape over the store ---
     results = R.replay_all(root=store1, python=py)
     if results.get(sid1, {}).get("outcome") != "red_green":
