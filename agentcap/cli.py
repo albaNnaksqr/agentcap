@@ -7,6 +7,7 @@
 """
 import argparse
 import json
+import os
 import sys
 
 from .snapshot import snapshot
@@ -60,6 +61,12 @@ def main(argv=None):
 
     vl = sub.add_parser("value", help="score trajectory value (groundedness x process richness)")
     vl.add_argument("--root", default=sess.DEFAULT_ROOT)
+
+    rp = sub.add_parser("replay", help="re-run fail_to_pass against the reconstructed "
+                                       "artifact; verified is earned here")
+    rp.add_argument("--root", default=sess.DEFAULT_ROOT)
+    rp.add_argument("--session", default=None, help="replay one session id")
+    rp.add_argument("--timeout", type=int, default=300)
 
     ex = sub.add_parser("export", help="export canonical records + RL task instances")
     ex.add_argument("out", help="destination directory")
@@ -127,6 +134,22 @@ def main(argv=None):
             else:
                 summary[v["value_tier"]] += 1
         print(json.dumps(summary, indent=2))
+    elif a.cmd == "replay":
+        from . import replay as RP
+        if a.session:
+            sdir = os.path.join(a.root, "sessions", a.session)
+            print(json.dumps(RP.replay_session(sdir, timeout=a.timeout), indent=2))
+        else:
+            results = RP.replay_all(root=a.root, timeout=a.timeout)
+            summary = {"red_green": 0, "green_only": 0, "not_green": 0,
+                       "setup_failed": 0, "no_seed": 0, "verified": 0}
+            for r in results.values():
+                if r is None:
+                    summary["no_seed"] += 1
+                else:
+                    summary[r["outcome"]] += 1
+                    summary["verified"] += bool(r.get("verified"))
+            print(json.dumps(summary, indent=2))
     elif a.cmd == "export":
         from . import export as E
         summary = E.export_all(root=a.root, out=a.out, min_tier=a.min_tier)
