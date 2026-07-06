@@ -212,7 +212,7 @@ def _task_view(session, seed, val, steps, runs, repo_name):
         "env": {"bundle": "env/repo.bundle", "start": "env/env_start",
                 "end": "env/env_end", "blobs": "env/blobs"},
         "env_verified": val["env_verified"],
-        "verified": False,             # observed evidence; no re-execution happened
+        "verified": False,   # earned by `agentcap replay`; False until red/green reproduces
         # DPO chosen side: the captured solving trajectory + its provenance grade
         "reference": {
             "trajectory": "trajectory.jsonl",
@@ -267,10 +267,14 @@ def export_session(session_dir, out, min_tier="medium"):
             f.write(json.dumps(s, sort_keys=True).replace(repo_abs, ".") + "\n")
 
     seed = _load(os.path.join(session_dir, "task_seed.json")) or T.extract_seed(session_dir)
+    replay_rep = _load(os.path.join(session_dir, "replay.json"))
     task = None
     if seed:
         runs = tooltrace.test_runs(traj["log_path"], traj.get("agent"))
         task = _task_view(session, seed, val, steps, runs, repo_name)
+        if replay_rep:
+            task["verified"] = bool(replay_rep.get("verified"))
+            task["replay_outcome"] = replay_rep.get("outcome")
         _write(os.path.join(sdir, "task.json"), task)
 
     verify_rep = _load(os.path.join(session_dir, "verify.json")) or {}
@@ -291,6 +295,8 @@ def export_session(session_dir, out, min_tier="medium"):
         "value": val,
         "verify": {k: verify_rep.get(k) for k in
                    ("verified", "benchmark_eligible", "join_confidence")},
+        "replay": ({"outcome": replay_rep.get("outcome"),
+                    "verified": replay_rep.get("verified")} if replay_rep else None),
         "delta": _load(os.path.join(session_dir, "delta.json")),
         "files": {"trajectory": "trajectory.jsonl",
                   "task": "task.json" if task else None, "env": "env/"},

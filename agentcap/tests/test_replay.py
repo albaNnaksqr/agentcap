@@ -128,6 +128,19 @@ def main():
     else:
         print("[ok] replay_all: batch summary over the store")
 
+    # --- export integration: verified flows from replay.json ---
+    out1 = os.path.join(tmp, "out_rg")
+    E.export_all(root=store1, out=out1)
+    task1 = json.load(open(os.path.join(out1, sid1, "task.json")))
+    rec1 = json.load(open(os.path.join(out1, sid1, "record.json")))
+    if not task1["verified"] or task1.get("replay_outcome") != "red_green":
+        fails.append("export should carry earned verified: %s / %s"
+                     % (task1["verified"], task1.get("replay_outcome")))
+    elif (rec1.get("replay") or {}).get("outcome") != "red_green":
+        fails.append("record should embed replay outcome: %s" % rec1.get("replay"))
+    else:
+        print("[ok] export: verified earned via replay, embedded in task+record")
+
     if fails:
         print("\n".join("[FAIL] " + f for f in fails))
         sys.exit(1)
