@@ -5,13 +5,19 @@ trajectory log. Per-agent shapes, verified against real logs:
           paired with a later tool_result{tool_use_id, content}
   Codex:  response_item.payload -> function_call{arguments(JSON: cmd), call_id}
           paired with function_call_output{call_id, output}
+          (>=0.144) custom_tool_call{name:"exec", input: JS with
+          tools.exec_command({cmd:...})} paired with custom_tool_call_output
 
 We only surface runs whose command a known test framework claims (testparse) —
 each run carries its framework tag. If a log can't be parsed, it yields nothing
 (no event beats a wrong event)."""
 import json
+import re
 
 from . import testparse
+
+# codex exec `input` may quote the key or not: {cmd:...} or {"cmd":...}
+_CODEX_CMD_KEY = re.compile(r'["\']?cmd["\']?\s*:\s*')
 
 
 def _text(content):
@@ -31,6 +37,30 @@ def _text(content):
 
 def _is_test_cmd(cmd):
     return testparse.detect_framework(cmd) is not None
+
+
+def _codex_exec_cmd(input_str):
+    """codex >=0.144 runs shell via a `custom_tool_call` (name="exec") whose
+    `input` is a JS snippet, e.g.
+        const r = await tools.exec_command({cmd:"pytest ...",workdir:"..."});
+    Pull the shell command out of the first exec_command({cmd:...}) call. The
+    value after `cmd:` is valid JSON (a string, or a list of argv), so decode it
+    directly. Non-shell tools (update_plan, ...) have no exec_command -> None."""
+    if not isinstance(input_str, str):
+        return None
+    i = input_str.find("exec_command")
+    if i == -1:
+        return None
+    m = _CODEX_CMD_KEY.search(input_str, i)
+    if not m:
+        return None
+    try:
+        val, _ = json.JSONDecoder().raw_decode(input_str, m.end())
+    except ValueError:
+        return None
+    if isinstance(val, list):
+        return " ".join(str(x) for x in val)
+    return val if isinstance(val, str) else None
 
 
 def claude_runs(path):
@@ -77,7 +107,12 @@ def codex_runs(path):
             cid = p.get("call_id")
             calls[cid] = (cmd, ts)
             order.append(cid)
-        elif pt == "function_call_output":
+        elif pt == "custom_tool_call" and p.get("name") == "exec":
+            cmd = _codex_exec_cmd(p.get("input"))
+            cid = p.get("call_id")
+            calls[cid] = (cmd, ts)
+            order.append(cid)
+        elif pt in ("function_call_output", "custom_tool_call_output"):
             out = p.get("output")
             outputs[p.get("call_id")] = out if isinstance(out, str) else _text(out)
     return _pair(calls, outputs, order)
