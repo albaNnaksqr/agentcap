@@ -11,6 +11,7 @@ Method (see the method write-up):
 """
 import json
 import os
+import re
 
 from . import session as sess
 from . import testparse
@@ -20,12 +21,34 @@ from .snapshot import load_manifest
 # parsing lives in testparse now (framework-aware); kept as a name for callers/tests
 parse_pytest = testparse.parse_pytest
 
+# explicit pytest node targets in a command, e.g. `path/to/test_x.py::test_y`
+# (also class::method and parametrized [id] forms).
+_NODE_RE = re.compile(r"[\w./\\-]+\.py::[\w:.\[\]-]+")
+
+
+def _cmd_nodes(cmd):
+    return _NODE_RE.findall(cmd or "")
+
 
 def _timeline(runs):
     """runs sorted by time. Return (candidate_ftp, candidate_ptp, evidence)."""
     parsed = []
     for r in sorted(runs, key=lambda r: (r.get("ts") or "", r["idx"])):
         p = testparse.parse(r["output"], r.get("framework"))
+        # When the command explicitly targets a SINGLE node, attribute this run's
+        # count-level pass/fail to that node id. Covers `pytest -q path::node`,
+        # whose output carries counts + a bare-name FAILURES banner but no
+        # `path::node FAILED` line for the parser to key a node on. Single target
+        # only -> the counts are unambiguous.
+        nodes = _cmd_nodes(r.get("cmd"))
+        if len(nodes) == 1:
+            n = nodes[0]
+            c = p.get("counts", {})
+            failed = c.get("failed", 0) or c.get("error", 0)
+            if failed and n not in p["failed"]:
+                p = {**p, "failed": p["failed"] | {n}}
+            elif c.get("passed", 0) and not failed and n not in p["passed"]:
+                p = {**p, "passed": p["passed"] | {n}}
         parsed.append((r, p))
     if not parsed:
         return set(), set(), []
