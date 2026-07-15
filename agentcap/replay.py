@@ -50,11 +50,14 @@ def _ensure_python(root):
     return py
 
 
-def _run_test(python, tree, node_id, timeout):
+def _run_test(python, tree, node_id, timeout, pythonpath=None):
     """-> passed | failed | missing | error | timeout, for one node id.
     Per-id runs keep one stale id from aborting the whole batch (pytest
-    refuses to run anything when any given id fails collection)."""
-    env = dict(os.environ, PYTHONPATH=".", PYTHONDONTWRITEBYTECODE="1")
+    refuses to run anything when any given id fails collection).
+    pythonpath: repo-relative components (cwd=tree) so the reconstructed package
+    is imported for src/ or python/ layouts; defaults to the tree root."""
+    pp = os.pathsep.join(pythonpath) if pythonpath else "."
+    env = dict(os.environ, PYTHONPATH=pp, PYTHONDONTWRITEBYTECODE="1")
     try:
         p = subprocess.run([python, "-m", "pytest", "-q", "--no-header", node_id],
                            cwd=tree, env=env, capture_output=True, text=True,
@@ -86,6 +89,7 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None):
     session = json.load(open(os.path.join(session_dir, "session.json")))
     seed = json.load(open(seed_p))
     ftp = seed["candidate_fail_to_pass"]
+    pp = seed.get("test_pythonpath") or None
     report = {
         "replay_version": REPLAY_VERSION, "outcome": "setup_failed",
         "verified": False, "reason": None, "error": None, "tests": [],
@@ -105,7 +109,7 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None):
         end_tree = _materialize(workdir, "end", bundle,
                                 os.path.join(session_dir, "env_end"),
                                 session["cas_root"])
-        tests = [{"node_id": n, "end_status": _run_test(python, end_tree, n, timeout),
+        tests = [{"node_id": n, "end_status": _run_test(python, end_tree, n, timeout, pp),
                   "start_status": None} for n in ftp]
         report["durations"]["end_s"] = round(time.time() - t0, 1)
         if any(t["end_status"] == "timeout" for t in tests):
@@ -127,7 +131,7 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None):
                 shutil.copyfile(src, dst)
                 report["overlaid_test_files"].append(rel)
             for t in runnable:
-                t["start_status"] = _run_test(python, start_tree, t["node_id"], timeout)
+                t["start_status"] = _run_test(python, start_tree, t["node_id"], timeout, pp)
             report["durations"]["start_s"] = round(time.time() - t0, 1)
             if any(t["start_status"] == "timeout" for t in runnable):
                 report.update(tests=tests, reason="timeout")

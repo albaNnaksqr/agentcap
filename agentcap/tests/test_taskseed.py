@@ -138,6 +138,22 @@ def main():
     else:
         print("[ok] no test runs -> no seed (silent-noise avoided)")
 
+    # --- PYTHONPATH extraction: $PWD/subdir, abs-under-cwd, and drop-outside ---
+    cwd = "/home/u/wt/repo"
+    pp = T._pythonpath_components('PYTHONPATH=$PWD/python python -m pytest a::b', cwd)
+    if pp != ["python"]:
+        fails.append("pythonpath $PWD/python -> ['python'], got %s" % pp)
+    pp2 = T._pythonpath_components('PYTHONPATH="$PWD:%s/src" pytest x::y' % cwd, cwd)
+    if pp2 != [".", "src"]:
+        fails.append("pythonpath quoted $PWD:abs-under-cwd -> ['.','src'], got %s" % pp2)
+    pp3 = T._pythonpath_components('PYTHONPATH=/opt/site-packages pytest x::y', cwd)
+    if pp3 != []:
+        fails.append("pythonpath outside worktree should be dropped, got %s" % pp3)
+    if any(f.startswith("pythonpath") for f in fails):
+        pass
+    else:
+        print("[ok] pythonpath: $PWD/subdir relativized, machine-abs dropped")
+
     print("-" * 50)
     if fails:
         print("FAIL (%d):" % len(fails))

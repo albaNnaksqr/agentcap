@@ -30,6 +30,38 @@ def _cmd_nodes(cmd):
     return _NODE_RE.findall(cmd or "")
 
 
+# PYTHONPATH=<val> in a test command; val may be quoted or bare (up to whitespace)
+_PP_RE = re.compile(r'PYTHONPATH=("([^"]*)"|\'([^\']*)\'|(\S+))')
+
+
+def _pythonpath_components(cmd, cwd):
+    """Repo-relative PYTHONPATH the agent used for a test run, so replay imports
+    the reconstructed tree (not an installed copy). Agents commonly run e.g.
+    `PYTHONPATH=$PWD/python pytest ...` for a src/ or python/ package layout.
+    `$PWD`/absolute paths under the worktree are made relative; machine-specific
+    absolute paths (site-packages, ...) are dropped."""
+    m = _PP_RE.search(cmd or "")
+    if not m:
+        return []
+    val = m.group(2) or m.group(3) or m.group(4) or ""
+    cwd = (cwd or "").rstrip("/")
+    out = []
+    for raw in val.split(":"):
+        c = raw.replace("${PWD}", cwd).replace("$PWD", cwd).strip()
+        if not c:
+            continue
+        if os.path.isabs(c):
+            if cwd and (c == cwd or c.startswith(cwd + "/")):
+                c = os.path.relpath(c, cwd)
+            else:
+                continue  # outside the worktree -> not reconstructable
+        if c.startswith("./"):
+            c = c[2:] or "."
+        if c and c not in out:
+            out.append(c)
+    return out
+
+
 def _timeline(runs):
     """runs sorted by time. Return (candidate_ftp, candidate_ptp, evidence)."""
     parsed = []
@@ -112,6 +144,23 @@ def extract_seed(session_dir):
     if not ftp and not counts_only:
         return None
 
+    # PYTHONPATH the agent actually used (prefer a run that targeted an ftp node,
+    # else any pytest run). Lets replay import the reconstructed tree for src/ or
+    # python/ package layouts instead of falling back to an installed copy.
+    cwd = traj.get("cwd", "")
+    test_pythonpath = []
+    for r in runs:
+        cmd = r.get("cmd") or ""
+        if any(n in cmd for n in ftp):
+            test_pythonpath = _pythonpath_components(cmd, cwd)
+            break
+    if not test_pythonpath:
+        for r in runs:
+            pp = _pythonpath_components(r.get("cmd") or "", cwd)
+            if pp:
+                test_pythonpath = pp
+                break
+
     # NOTE: no strong/weak/counts quality tier here anymore. Judging trajectory
     # value (incl. that agent-authored tests are normal) lives in value.assess().
     # These are neutral candidate signals a sandbox-builder can use.
@@ -120,6 +169,7 @@ def extract_seed(session_dir):
         "candidate_fail_to_pass": sorted(ftp),
         "candidate_pass_to_pass": sorted(ptp),
         "test_files": test_files,
+        "test_pythonpath": test_pythonpath,  # repo-relative; [] -> replay uses "."
         "source_delta": source_delta,
         "test_only_delta": test_only,       # a flag, not a verdict
         "evidence": evidence,
