@@ -234,6 +234,58 @@ def main():
     else:
         print("[ok] S10 interpreter fallback: uncollectable -> recorded venv, labelled")
 
+    # --- S11 unittest ids: dotted targets are run by unittest, not pytest ---
+    if R.runner_for("tests/t.py::test_x") != "pytest" or \
+            R.runner_for("pkg.mod.Case.test_x") != "unittest":
+        fails.append("runner_for misroutes ids")
+    else:
+        # a unittest.TestCase suite, discovered from tests/ -> ids are relative to
+        # that dir, so the module is NOT importable from the repo root
+        UT_TEST = ("import unittest\nfrom mod import f\n\n"
+                   "class Case(unittest.TestCase):\n"
+                   "    def test_f(self):\n        self.assertEqual(f(), 1)\n")
+        UT_RED = ("test_f (test_mod.Case.test_f) ... FAIL\n"
+                  "\nFAIL: test_f (test_mod.Case.test_f)\n"
+                  "\nRan 1 test in 0.001s\n\nFAILED (failures=1)\n")
+        UT_GREEN = ("test_f (test_mod.Case.test_f) ... ok\n"
+                    "\nRan 1 test in 0.001s\n\nOK\n")
+        UT_NODE = "test_mod.Case.test_f"
+        from agentcap import taskseed as T2
+        from agentcap.tests.test_export import build as build2
+        repo11, store11, sid11 = build2(
+            tmp, "ut", {"mod.py": MOD_RED, "tests/test_mod.py": UT_TEST},
+            {"mod.py": MOD_GREEN},
+            [("user", "fix it"),
+             ("bash", "python -m unittest discover -s tests -v", UT_RED),
+             ("edit", "mod.py"),
+             ("bash", "python -m unittest discover -s tests -v", UT_GREEN)])
+        sdir11 = os.path.join(store11, "sessions", sid11)
+        seed11 = T2.extract_seed(sdir11)
+        if not seed11 or seed11["candidate_fail_to_pass"] != [UT_NODE]:
+            fails.append("S11 fixture seed wrong: %s"
+                         % (seed11 and seed11["candidate_fail_to_pass"]))
+        else:
+            rep11 = R.replay_session(sdir11, python=py)
+            row = rep11["tests"][0] if rep11.get("tests") else {}
+            if rep11["outcome"] != "red_green" or not rep11["verified"]:
+                fails.append("S11 unittest session should verify: %s / %s"
+                             % (rep11["outcome"], rep11.get("error")))
+            elif row.get("runner") != "unittest":
+                fails.append("S11 runner not recorded: %s" % row)
+            elif row.get("end_status") != "passed" or row.get("start_status") != "failed":
+                fails.append("S11 per-id statuses wrong: %s" % row)
+            else:
+                print("[ok] S11 unittest: dotted id run via unittest, red_green earned")
+
+        # a dotted id that exists nowhere in the tree stays missing, never invented
+        if R._run_test(py, repo11, "no.such.Case.test_x", 60) != "missing":
+            fails.append("S11 unknown dotted id should be missing")
+        elif R._unittest_root(repo11, UT_NODE) != "tests":
+            fails.append("S11 import root should be tests/: %s"
+                         % R._unittest_root(repo11, UT_NODE))
+        else:
+            print("[ok] S11 import root derived from the tree; unknown id stays missing")
+
     # --- replay_all: batch shape over the store ---
     results = R.replay_all(root=store1, python=py)
     if results.get(sid1, {}).get("outcome") != "red_green":

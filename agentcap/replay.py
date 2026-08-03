@@ -23,6 +23,7 @@ import tempfile
 import time
 
 from . import session as sess
+from . import testparse
 from .export import _bundle
 from .verify import reconstruct
 
@@ -110,12 +111,70 @@ def _artifact_source(session, workdir, allow_local_repo):
         return session["repo"], "local_repo", reason
 
 
+_PRUNE = {".git", "node_modules", "__pycache__", ".venv", "venv"}
+
+
+def runner_for(node_id):
+    """pytest ids carry a path (`tests/t.py::test_x`); unittest ids are dotted
+    (`pkg.mod.Case.test_x`) and only `python -m unittest` can run them."""
+    return "pytest" if "::" in node_id else "unittest"
+
+
+def _unittest_root(tree, node_id):
+    """Directory that must be importable for a dotted id to resolve, relative to
+    the tree. `unittest discover -s tests` yields ids relative to `tests/`, so the
+    module is not importable from the repo root — find the module file and hand
+    back the directory above it. None when it cannot be located."""
+    parts = node_id.split(".")
+    py_files = []
+    for dirpath, dirnames, filenames in os.walk(tree):
+        dirnames[:] = [d for d in dirnames if d not in _PRUNE]
+        for fn in filenames:
+            if fn.endswith(".py"):
+                py_files.append(os.path.relpath(os.path.join(dirpath, fn), tree))
+    for i in range(len(parts), 0, -1):
+        rel = os.path.join(*parts[:i]) + ".py"
+        if rel in py_files:
+            return "."
+        hits = [p for p in py_files if p.endswith(os.sep + rel)]
+        if len(hits) == 1:
+            return hits[0][:-len(rel)].rstrip(os.sep)
+        if len(hits) > 1:
+            return None          # ambiguous basename -> refuse, same as taskseed
+    return None
+
+
+def _run_unittest(python, tree, node_id, timeout, pythonpath):
+    root = _unittest_root(tree, node_id)
+    if root is None:
+        return "missing"
+    pp = [root] + [c for c in (pythonpath or ["."]) if c != root]
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(pp),
+               PYTHONDONTWRITEBYTECODE="1")
+    try:
+        p = subprocess.run([python, "-m", "unittest", "-v", node_id],
+                           cwd=tree, env=env, capture_output=True, text=True,
+                           timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return "timeout"
+    if p.returncode == 0:
+        return "passed"
+    out = p.stdout + p.stderr
+    if "Ran 0 tests" in out or testparse._U_LOADER_STUB in out or "has no attribute" in out:
+        return "missing"          # id does not exist here — mirrors pytest collection
+    if "Ran " not in out:
+        return "error"            # the runner never started (bad interpreter, etc.)
+    return "failed"
+
+
 def _run_test(python, tree, node_id, timeout, pythonpath=None):
     """-> passed | failed | missing | error | timeout, for one node id.
     Per-id runs keep one stale id from aborting the whole batch (pytest
     refuses to run anything when any given id fails collection).
     pythonpath: repo-relative components (cwd=tree) so the reconstructed package
     is imported for src/ or python/ layouts; defaults to the tree root."""
+    if runner_for(node_id) == "unittest":
+        return _run_unittest(python, tree, node_id, timeout, pythonpath)
     pp = os.pathsep.join(pythonpath) if pythonpath else "."
     env = dict(os.environ, PYTHONPATH=pp, PYTHONDONTWRITEBYTECODE="1")
     try:
@@ -180,7 +239,8 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None,
         end_tree = _materialize(workdir, "end", source,
                                 os.path.join(session_dir, "env_end"),
                                 session["cas_root"])
-        tests = [{"node_id": n, "end_status": _run_test(python, end_tree, n, timeout, pp),
+        tests = [{"node_id": n, "runner": runner_for(n),
+                  "end_status": _run_test(python, end_tree, n, timeout, pp),
                   "start_status": None} for n in ftp]
 
         # Nothing collected at all usually means the interpreter cannot import the
@@ -193,7 +253,7 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None,
             # symlink to the base interpreter, and it is the invocation path that
             # gives it its site-packages. realpath would collapse them into one.
             if recorded and os.path.abspath(recorded) != os.path.abspath(python):
-                retry = [{"node_id": n,
+                retry = [{"node_id": n, "runner": runner_for(n),
                           "end_status": _run_test(recorded, end_tree, n, timeout, pp),
                           "start_status": None} for n in ftp]
                 if any(t["end_status"] != "missing" for t in retry):
