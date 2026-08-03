@@ -122,6 +122,36 @@ def main():
     else:
         print("[ok] unittest counts (OK and FAILED forms)")
 
+    # --- unittest node ids: verbose lines + summary banner, both py layouts ---
+    u_v = tp.parse(
+        "test_errors (test_shapes.ShapeCase.test_errors) ... ERROR\n"
+        "test_fails (test_shapes.ShapeCase.test_fails) ... FAIL\n"
+        "test_ok (test_shapes.ShapeCase.test_ok) ... ok\n"
+        "test_skipped (test_shapes.ShapeCase.test_skipped) ... skipped 'nope'\n"
+        "\nERROR: test_errors (test_shapes.ShapeCase.test_errors)\n"
+        "\nFAIL: test_fails (test_shapes.ShapeCase.test_fails)\n"
+        "\nRan 4 tests in 0.002s\n\nFAILED (failures=1, errors=1, skipped=1)\n", "unittest")
+    u_old = tp.parse(                       # py<=3.10 stops at the class name
+        "test_a (mod.Case) ... ok\ntest_b (mod.Case) ... FAIL\n"
+        "\nFAIL: test_b (mod.Case)\n\nRan 2 tests in 0.001s\n\nFAILED (failures=1)\n",
+        "unittest")
+    u_quiet = tp.parse(                     # no -v: only the banner names a node
+        ".F\nFAIL: test_b (mod.Case.test_b)\n\nRan 2 tests in 0.001s\n"
+        "\nFAILED (failures=1)\n", "unittest")
+    if u_v["failed"] != {"test_shapes.ShapeCase.test_errors",
+                         "test_shapes.ShapeCase.test_fails"}:
+        fails.append("unittest verbose failed nodes wrong: %s" % sorted(u_v["failed"]))
+    elif u_v["passed"] != {"test_shapes.ShapeCase.test_ok"}:
+        fails.append("skipped must not count as passed: %s" % sorted(u_v["passed"]))
+    elif u_v["counts"].get("passed") != 1 or u_v["counts"].get("skipped") != 1:
+        fails.append("Ran N includes skips; passed must exclude them: %s" % u_v["counts"])
+    elif u_old["failed"] != {"mod.Case.test_b"} or u_old["passed"] != {"mod.Case.test_a"}:
+        fails.append("py<=3.10 class-only form wrong: %s" % u_old)
+    elif u_quiet["failed"] != {"mod.Case.test_b"} or u_quiet["passed"]:
+        fails.append("non-verbose banner-only parse wrong: %s" % u_quiet)
+    else:
+        print("[ok] unittest node ids: verbose + banner, both python layouts")
+
     # --- go: verbose nodes + quiet ok ---
     g_v = tp.parse("--- FAIL: TestFoo\n--- PASS: TestBar\nFAIL\nexit status 1\n", "go")
     g_q = tp.parse("ok  \texample.com/pkg\t0.012s\n", "go")

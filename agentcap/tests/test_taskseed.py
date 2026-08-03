@@ -154,6 +154,46 @@ def main():
     else:
         print("[ok] pythonpath: $PWD/subdir relativized, machine-abs dropped")
 
+    # --- unittest dotted ids: resolved to a repo file, or refused ---
+    end = {"tests/test_mod.py", "src/mod.py", "pkg/sub/test_deep.py", "other/test_deep.py"}
+    r_disc = T._node_path("test_mod.Case.test_f", end)          # discover -s tests
+    r_full = T._node_path("pkg.sub.test_deep.Case.test_f", end)  # full dotted path
+    r_amb = T._node_path("test_deep.Case.test_f", end)           # two files, same basename
+    r_none = T._node_path("nope.Case.test_f", end)
+    r_pytest = T._node_path("tests/test_mod.py::test_f", end)    # unchanged behaviour
+    r_gone = T._node_path("tests/deleted.py::test_f", end)
+    if r_disc != "tests/test_mod.py":
+        fails.append("discover-relative dotted id unresolved: %s" % r_disc)
+    elif r_full != "pkg/sub/test_deep.py":
+        fails.append("full dotted path unresolved: %s" % r_full)
+    elif r_amb is not None:
+        fails.append("ambiguous basename must refuse, got %s" % r_amb)
+    elif r_none is not None or r_gone is not None:
+        fails.append("unknown ids must resolve to None: %s / %s" % (r_none, r_gone))
+    elif r_pytest != "tests/test_mod.py":
+        fails.append("pytest id resolution changed: %s" % r_pytest)
+    else:
+        print("[ok] unittest dotted ids grounded to files; ambiguity refused")
+
+    # --- end-to-end: a unittest session yields a dotted FTP, grounded ---
+    U_RED = ("test_f (tests.test_mod.Case.test_f) ... FAIL\n"
+             "\nFAIL: test_f (tests.test_mod.Case.test_f)\n"
+             "\nRan 1 test in 0.001s\n\nFAILED (failures=1)\n")
+    U_GREEN = "test_f (tests.test_mod.Case.test_f) ... ok\n\nRan 1 test in 0.001s\n\nOK\n"
+    sdir_u = build_session(tmp, "unittest_rg", source_fix=True,
+                           log_runs=[("python -m unittest discover -s tests -v", U_RED),
+                                     ("python -m unittest discover -s tests -v", U_GREEN)])
+    seed_u = T.extract_seed(sdir_u)
+    if not seed_u or seed_u["candidate_fail_to_pass"] != ["tests.test_mod.Case.test_f"]:
+        fails.append("unittest session should seed a dotted FTP: %s"
+                     % (seed_u and seed_u["candidate_fail_to_pass"]))
+    elif seed_u["test_files"] != ["tests/test_mod.py"]:
+        fails.append("test_files should hold the resolved path: %s" % seed_u["test_files"])
+    elif seed_u["source_delta"] != ["src/mod.py"]:
+        fails.append("source_delta wrong: %s" % seed_u["source_delta"])
+    else:
+        print("[ok] unittest red->green session seeds a grounded dotted FTP")
+
     print("-" * 50)
     if fails:
         print("FAIL (%d):" % len(fails))

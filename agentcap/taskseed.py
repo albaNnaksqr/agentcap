@@ -110,6 +110,31 @@ def _timeline(runs):
     return ftp, ptp, evidence
 
 
+def _node_path(node, end_paths):
+    """The repo file a node id lives in, or None when it cannot be pinned.
+
+    A pytest id carries the path outright. A unittest id is dotted
+    (pkg.mod.Case.test_x) and its module part is relative to whatever root the
+    run used — `unittest discover -s tests` yields `test_mod.Case.test_x` for
+    `tests/test_mod.py` — so walk the dotted prefixes longest-first and match by
+    path suffix. An ambiguous basename resolves to nothing rather than a guess.
+    """
+    if "::" in node:
+        p = node.split("::", 1)[0]
+        return p if p in end_paths else None
+    parts = node.split(".")
+    for i in range(len(parts), 0, -1):
+        rel = "/".join(parts[:i]) + ".py"
+        if rel in end_paths:
+            return rel
+        hits = [p for p in end_paths if p.endswith("/" + rel)]
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            return None
+    return None
+
+
 def _load_json(path):
     return json.load(open(path)) if os.path.exists(path) else None
 
@@ -129,11 +154,12 @@ def extract_seed(session_dir):
 
     # D. ground: test files must exist in env_end; classify the delta.
     end_paths = {e["path"] for e in load_manifest(os.path.join(session_dir, "env_end"))["entries"]}
-    ftp = {n for n in ftp if n.split("::", 1)[0] in end_paths}
-    ptp = {n for n in ptp if n.split("::", 1)[0] in end_paths}
+    node_paths = {n: _node_path(n, end_paths) for n in (ftp | ptp)}
+    ftp = {n for n in ftp if node_paths.get(n)}
+    ptp = {n for n in ptp if node_paths.get(n)}
 
     changed = sorted(set(delta["added"]) | set(delta["modified"]))
-    test_files = sorted({n.split("::", 1)[0] for n in (ftp | ptp)}
+    test_files = sorted({node_paths[n] for n in (ftp | ptp)}
                         | {c for c in changed if _looks_test(c)})
     source_delta = [c for c in changed if not _looks_test(c)]
     test_only = bool(changed) and not source_delta

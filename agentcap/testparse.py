@@ -1,8 +1,12 @@
 """Framework-aware test-run recognition and output parsing. One shape out for every
 framework: {"failed": set, "passed": set, "counts": {passed/failed/error/skipped}} —
-node-level sets where the framework prints them (pytest / go / cargo), counts-only
-where it doesn't (js / unittest). No recognized framework in a command means it is
-not a test run; an unrecognized framework must yield empty evidence, never a guess.
+node-level sets where the framework prints them (pytest / go / cargo / unittest -v),
+counts-only where it doesn't (js, or unittest run without -v). No recognized framework
+in a command means it is not a test run; an unrecognized framework must yield empty
+evidence, never a guess.
+
+unittest ids are the dotted targets unittest itself takes (pkg.mod.Case.test_x), NOT
+pytest node ids — a consumer that re-runs them has to invoke the right runner.
 """
 import re
 
@@ -45,31 +49,71 @@ def parse_pytest(output):
     return {"failed": failed, "passed": passed, "counts": counts}
 
 
-# --- unittest (counts-only: Ran N + OK / FAILED (failures=x, errors=y)) ---
+# --- unittest (counts always; node-level when the run was verbose) ---
 _U_RAN = re.compile(r'^Ran (\d+) tests?', re.M)
 _U_FAILED = re.compile(r'^FAILED \(([^)]*)\)', re.M)
+# `-v` per-test line: "test_x (pkg.mod.Case.test_x) ... ok" (py>=3.11) or
+# "test_x (pkg.mod.Case) ... FAIL" (py<=3.10). The status must be on the same
+# line: a test that prints to stdout mid-run splits them, and then only the
+# summary banner below can see the failure.
+_U_VERBOSE = re.compile(r'^(\w+) \(([\w.]+)\)(?: \([^)]*\))? \.\.\. ?(.*)$', re.M)
+# summary banner, present with or without -v: "FAIL: test_x (pkg.mod.Case.test_x)"
+_U_BANNER = re.compile(r'^(?:FAIL|ERROR): (\w+) \(([\w.]+)\)', re.M)
+# unittest reports an import failure as a synthetic test on its own loader. It names
+# no real node, so it must never become a task id.
+_U_LOADER_STUB = "unittest.loader._FailedTest"
+
+
+def _u_node(name, dotted):
+    """-> the dotted target `python -m unittest` itself accepts. py>=3.11 already
+    ends the parenthesised path with the method name; older versions stop at the
+    class."""
+    return dotted if dotted.rsplit(".", 1)[-1] == name else "%s.%s" % (dotted, name)
 
 
 def parse_unittest(output):
     m = _U_RAN.search(output)
     ran = int(m.group(1)) if m else 0
-    failed = errors = 0
+    failed_n = errors_n = skipped_n = 0
     fm = _U_FAILED.search(output)
     if fm:
         for part in fm.group(1).split(","):
             k, _, v = part.strip().partition("=")
-            if k == "failures" and v.isdigit():
-                failed = int(v)
-            elif k == "errors" and v.isdigit():
-                errors = int(v)
+            if not v.isdigit():
+                continue
+            if k == "failures":
+                failed_n = int(v)
+            elif k == "errors":
+                errors_n = int(v)
+            elif k == "skipped":
+                skipped_n = int(v)
     counts = {}
     if ran:
-        counts["passed"] = max(ran - failed - errors, 0)
-    if failed:
-        counts["failed"] = failed
-    if errors:
-        counts["error"] = errors
-    return {"failed": set(), "passed": set(), "counts": counts}
+        # `Ran N` includes skips, so a skipped test must not be counted as a pass
+        counts["passed"] = max(ran - failed_n - errors_n - skipped_n, 0)
+    if failed_n:
+        counts["failed"] = failed_n
+    if errors_n:
+        counts["error"] = errors_n
+    if skipped_n:
+        counts["skipped"] = skipped_n
+
+    failed, passed = set(), set()
+    for name, dotted, status in _U_VERBOSE.findall(output):
+        node, st = _u_node(name, dotted), status.strip()
+        if node.startswith(_U_LOADER_STUB):
+            continue
+        if st in ("FAIL", "ERROR"):
+            failed.add(node)
+        elif st == "ok":
+            passed.add(node)
+        # skipped / expected failure / unexpected success carry no red-green
+        # signal, so they join neither set.
+    for name, dotted in _U_BANNER.findall(output):
+        node = _u_node(name, dotted)
+        if not node.startswith(_U_LOADER_STUB):
+            failed.add(node)
+    return {"failed": failed, "passed": passed - failed, "counts": counts}
 
 
 # --- go (node-level with -v; package ok/FAIL lines otherwise) ---
