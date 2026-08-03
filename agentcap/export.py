@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 
 from . import gitutil as g
 from . import session as sess
@@ -128,6 +129,43 @@ def _scan_text(text, where, hits):
             hits.append({"kind": name, "where": where})
 
 
+def _git_blob(repo, oid):
+    """Tracked content lives in the repo, not the CAS — a manifest entry's
+    content_hash IS the git blob oid. None when it cannot be read (repo gone,
+    object pruned), which the caller must treat as "assume the worst"."""
+    if not repo or not oid:
+        return None
+    p = subprocess.run(["git", "-C", repo, "cat-file", "blob", oid],
+                       capture_output=True)
+    return p.stdout if p.returncode == 0 else None
+
+
+def _dotenv_hit(env, e, session, hits):
+    """A .env* entry: quarantine on the name only when the file is UNTRACKED.
+
+    A tracked .env is already part of the repo we ship inside the artifact, so
+    refusing to export the trajectory over it protects nothing — it just burns
+    the session (litellm tracks `ui/litellm-dashboard/.env.production`, whose
+    entire content is `NODE_ENV=production`). Untracked is the case that matters:
+    a file that exists only on this machine is where local secrets live.
+    Tracked ones are judged by content, with the same patterns as everything else.
+    """
+    where = "%s:%s" % (env, e["path"])
+    if e.get("untracked"):
+        hits.append({"kind": "dotenv_file", "where": where})
+        return
+    if e.get("type") != "file" or e.get("status") != "present":
+        hits.append({"kind": "dotenv_file", "where": where,
+                     "reason": "tracked .env not readable as a file"})
+        return
+    blob = _git_blob(session.get("repo"), e.get("content_hash"))
+    if blob is None:
+        hits.append({"kind": "dotenv_file", "where": where,
+                     "reason": "tracked .env whose content could not be read"})
+        return
+    _scan_text(blob.decode(errors="ignore"), where, hits)
+
+
 def _redaction_hits(session_dir, session, steps):
     hits = []
     _scan_text("\n".join(json.dumps(s) for s in steps), "trajectory", hits)
@@ -142,7 +180,7 @@ def _redaction_hits(session_dir, session, steps):
         for e in (man or {}).get("entries", []):
             base = e["path"].rsplit("/", 1)[-1]
             if base.startswith(".env") and base not in _ENV_OK:
-                hits.append({"kind": "dotenv_file", "where": "%s:%s" % (env, e["path"])})
+                _dotenv_hit(env, e, session, hits)
             if e.get("untracked") and e["status"] == "present" and e["type"] == "file":
                 bp = _blob_path(session["cas_root"], e["content_hash"])
                 if os.path.exists(bp):
@@ -275,6 +313,9 @@ def export_session(session_dir, out, min_tier="medium"):
         if replay_rep:
             task["verified"] = bool(replay_rep.get("verified"))
             task["replay_outcome"] = replay_rep.get("outcome")
+            # a consumer that needs to rebuild the artifact elsewhere must be able
+            # to tell an earned-but-machine-local verdict from a portable one
+            task["replay_portability"] = replay_rep.get("portability")
         _write(os.path.join(sdir, "task.json"), task)
 
     verify_rep = _load(os.path.join(session_dir, "verify.json")) or {}
@@ -296,7 +337,11 @@ def export_session(session_dir, out, min_tier="medium"):
         "verify": {k: verify_rep.get(k) for k in
                    ("verified", "benchmark_eligible", "join_confidence")},
         "replay": ({"outcome": replay_rep.get("outcome"),
-                    "verified": replay_rep.get("verified")} if replay_rep else None),
+                    "verified": replay_rep.get("verified"),
+                    "portability": replay_rep.get("portability"),
+                    "artifact_source": replay_rep.get("artifact_source"),
+                    "interpreter_source": replay_rep.get("interpreter_source")}
+                   if replay_rep else None),
         "delta": _load(os.path.join(session_dir, "delta.json")),
         "files": {"trajectory": "trajectory.jsonl",
                   "task": "task.json" if task else None, "env": "env/"},

@@ -51,6 +51,34 @@ def claude_log(path, cwd, events):
             f.write(json.dumps(ln) + "\n")
 
 
+def codex_log(path, events):
+    """Write a codex rollout jsonl. Each event is (kind, cmd, output):
+      kind 'fc'    -> legacy function_call{arguments JSON} + function_call_output
+      kind 'exec'  -> codex >=0.144 custom_tool_call{name:exec, input JS} with
+                      an unquoted cmd key; 'execq' uses a quoted "cmd" key.
+    Output is written as the >=0.144 list-of-blocks shape."""
+    lines = []
+    for i, (kind, cmd, out) in enumerate(events):
+        ts = "2026-07-01T00:%02d:00.000Z" % i
+        cid = "call_%d" % i
+        if kind == "fc":
+            lines.append({"timestamp": ts, "payload": {"type": "function_call",
+                          "call_id": cid, "arguments": json.dumps({"cmd": cmd})}})
+            lines.append({"timestamp": ts, "payload": {"type": "function_call_output",
+                          "call_id": cid, "output": out}})
+        else:
+            key = '"cmd"' if kind == "execq" else "cmd"
+            js = ('const r = await tools.exec_command({%s:%s,"workdir":"/w"});\n'
+                  'text(r.output);' % (key, json.dumps(cmd)))
+            lines.append({"timestamp": ts, "payload": {"type": "custom_tool_call",
+                          "name": "exec", "call_id": cid, "input": js}})
+            lines.append({"timestamp": ts, "payload": {"type": "custom_tool_call_output",
+                          "call_id": cid, "output": [{"type": "input_text", "text": out}]}})
+    with open(path, "w") as f:
+        for ln in lines:
+            f.write(json.dumps(ln) + "\n")
+
+
 def main():
     fails = []
 
@@ -140,6 +168,25 @@ def main():
         fails.append("tooltrace multi-framework runs wrong: %s" % fw)
     else:
         print("[ok] tooltrace: npm/go runs surfaced with framework tags, ls skipped")
+
+    # --- codex log shapes: legacy function_call AND >=0.144 custom_tool_call
+    #     exec (quoted + unquoted cmd key) all surface as runs ---
+    tmp = tempfile.mkdtemp(prefix="agentcap-cx-")
+    clog = os.path.join(tmp, "codex.jsonl")
+    codex_log(clog, [
+        ("fc",    "python -m pytest -q", "tests/t.py::a FAILED\n1 failed in 0.1s"),
+        ("exec",  "python -m pytest -q", "tests/t.py::a PASSED\n1 passed in 0.1s"),
+        ("execq", "python -m pytest tests/t.py::a -vv", "1 passed in 0.1s"),
+        ("exec",  "rg -n foo bar.py", "no test here"),   # non-test exec -> skipped
+    ])
+    cruns = tooltrace.test_runs(clog, "codex")
+    if len(cruns) != 3 or any(r["framework"] != "pytest" for r in cruns):
+        fails.append("codex exec runs not surfaced: %s"
+                     % [(r["cmd"], r["framework"]) for r in cruns])
+    elif "FAILED" not in cruns[0]["output"] or "passed" not in cruns[1]["output"]:
+        fails.append("codex exec output not paired to command")
+    else:
+        print("[ok] codex: legacy fc + >=0.144 exec (quoted/unquoted cmd) surfaced")
 
     # --- end to end: a jest red->green session grounds (was systematically
     #     ungrounded when only pytest counted) ---

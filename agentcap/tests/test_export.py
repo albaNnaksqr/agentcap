@@ -178,6 +178,48 @@ def main():
     else:
         print("[ok] secret-bearing session quarantined, nothing written")
 
+    # --- tracked .env: judged by content, not by filename ---
+    # benign one (litellm ships exactly this shape) must NOT burn the session
+    files_env = dict(files)
+    files_env["ui/.env.production"] = "NODE_ENV=production\n"
+    _, store4, sid4 = build(tmp, "envok", files_env, edits, events)
+    out4 = os.path.join(tmp, "out_envok")
+    s4 = E.export_all(root=store4, out=out4)
+    if sid4 in s4["quarantined"]:
+        fails.append("benign tracked .env should not quarantine: %s"
+                     % s4["quarantined"][sid4])
+    elif sid4 not in s4["exported"]:
+        fails.append("benign tracked .env session should export: %s" % s4)
+    else:
+        print("[ok] tracked .env with no secret exports normally")
+
+    # a tracked .env that really holds a key must still be caught
+    files_bad = dict(files)
+    files_bad["ui/.env.production"] = "AWS_KEY=AKIAIOSFODNN7EXAMPLE\n"
+    _, store5, sid5 = build(tmp, "envbad", files_bad, edits, events)
+    out5 = os.path.join(tmp, "out_envbad")
+    s5 = E.export_all(root=store5, out=out5)
+    if sid5 not in s5["quarantined"]:
+        fails.append("tracked .env holding a key must quarantine: %s" % s5)
+    elif not any(h["kind"] == "aws_key" for h in s5["quarantined"][sid5]):
+        fails.append("hit should name the secret, not the filename: %s"
+                     % s5["quarantined"][sid5])
+    else:
+        print("[ok] tracked .env holding a real key still quarantined, by content")
+
+    # unreadable tracked content (repo gone) must fail closed, not open
+    repo6, store6, sid6 = build(tmp, "envgone", files_env, edits, events)
+    shutil.rmtree(repo6)
+    out6 = os.path.join(tmp, "out_envgone")
+    s6 = E.export_all(root=store6, out=out6)
+    if sid6 not in s6["quarantined"]:
+        fails.append("unreadable tracked .env must fail closed: %s" % s6)
+    elif not any("could not be read" in (h.get("reason") or "")
+                 for h in s6["quarantined"][sid6]):
+        fails.append("fail-closed reason not recorded: %s" % s6["quarantined"][sid6])
+    else:
+        print("[ok] unreadable tracked .env fails closed with a reason")
+
     # --- codex log shape normalizes too ---
     clog = os.path.join(tmp, "codex.jsonl")
     with open(clog, "w") as f:

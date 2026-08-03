@@ -67,6 +67,15 @@ def main(argv=None):
     rp.add_argument("--root", default=sess.DEFAULT_ROOT)
     rp.add_argument("--session", default=None, help="replay one session id")
     rp.add_argument("--timeout", type=int, default=300)
+    rp.add_argument("--python", default=None,
+                    help="pin the interpreter that runs the tests. Default: a clean "
+                         "pytest-only interpreter, falling back to the one the session "
+                         "recorded only when the clean one collects nothing")
+    rp.add_argument("--allow-local-repo", action="store_true",
+                    help="when a self-contained bundle cannot be built (e.g. a partial "
+                         "clone), rebuild from the live local repo instead. red/green is "
+                         "still earned, but the artifact is only machine-local — the "
+                         "report records portability=machine_local")
 
     ex = sub.add_parser("export", help="export canonical records + RL task instances")
     ex.add_argument("out", help="destination directory")
@@ -138,16 +147,22 @@ def main(argv=None):
         from . import replay as RP
         if a.session:
             sdir = os.path.join(a.root, "sessions", a.session)
-            print(json.dumps(RP.replay_session(sdir, timeout=a.timeout), indent=2))
+            print(json.dumps(RP.replay_session(sdir, timeout=a.timeout, python=a.python,
+                                               allow_local_repo=a.allow_local_repo),
+                             indent=2))
         else:
-            results = RP.replay_all(root=a.root, timeout=a.timeout)
+            results = RP.replay_all(root=a.root, timeout=a.timeout, python=a.python,
+                                    allow_local_repo=a.allow_local_repo)
             summary = {"red_green": 0, "green_only": 0, "not_green": 0,
-                       "setup_failed": 0, "no_seed": 0, "verified": 0}
+                       "setup_failed": 0, "no_seed": 0, "verified": 0,
+                       "machine_local": 0}
             for r in results.values():
                 if r is None:
                     summary["no_seed"] += 1
                 else:
                     summary[r["outcome"]] += 1
+                    if r.get("portability") == "machine_local":
+                        summary["machine_local"] += 1
                     summary["verified"] += bool(r.get("verified"))
             print(json.dumps(summary, indent=2))
     elif a.cmd == "export":
