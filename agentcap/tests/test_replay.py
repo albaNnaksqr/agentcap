@@ -121,6 +121,119 @@ def main():
     else:
         print("[ok] S5 TDD: end-authored test overlaid onto base, red verified")
 
+    # --- S6 provenance: a bundle-able repo must stay self_contained ---
+    if rep.get("artifact_source") != "bundle" or rep.get("portability") != "self_contained":
+        fails.append("S6 healthy repo should replay from a bundle: %s/%s"
+                     % (rep.get("artifact_source"), rep.get("portability")))
+    elif rep.get("artifact_fallback_reason") is not None:
+        fails.append("S6 no fallback reason expected: %s" % rep["artifact_fallback_reason"])
+    else:
+        print("[ok] S6 provenance: bundle path recorded as self_contained")
+
+    # --- S7 opt-in gate: an unbundleable source must NOT silently fall back ---
+    repo7, store7, sid7, sdir7 = seeded(tmp, "loc", files, {"mod.py": MOD_GREEN})
+    real_bundle = R._bundle
+
+    def boom(*_a, **_k):
+        raise RuntimeError("HTTP 413 from promisor remote")
+
+    R._bundle = boom
+    try:
+        rep7 = R.replay_session(sdir7, python=py)          # no allow_local_repo
+    finally:
+        R._bundle = real_bundle
+    if rep7["outcome"] != "setup_failed" or rep7["verified"]:
+        fails.append("S7 must NOT fall back without opt-in: %s" % rep7["outcome"])
+    elif "413" not in (rep7.get("error") or ""):
+        fails.append("S7 bundle failure must surface as the error: %s" % rep7.get("error"))
+    elif rep7.get("artifact_source") is not None:
+        fails.append("S7 no artifact should be claimed: %s" % rep7["artifact_source"])
+    else:
+        print("[ok] S7 opt-in gate: unbundleable source fails loudly by default")
+
+    # --- S8 forced fallback: source that can never bundle -> machine_local ---
+    repo8, store8, sid8, sdir8 = seeded(tmp, "loc2", files, {"mod.py": MOD_GREEN})
+    R._bundle = boom
+    try:
+        rep8 = R.replay_session(sdir8, python=py, allow_local_repo=True)
+    finally:
+        R._bundle = real_bundle
+    if rep8["outcome"] != "red_green" or not rep8["verified"]:
+        fails.append("S8 red/green must still be earned via local repo: %s" % rep8["outcome"])
+    elif rep8["artifact_source"] != "local_repo" or rep8["portability"] != "machine_local":
+        fails.append("S8 downgrade not recorded: %s/%s"
+                     % (rep8["artifact_source"], rep8["portability"]))
+    elif "413" not in (rep8.get("artifact_fallback_reason") or ""):
+        fails.append("S8 fallback reason not recorded: %s" % rep8.get("artifact_fallback_reason"))
+    else:
+        print("[ok] S8 local_repo: verified earned, portability downgraded and explained")
+
+    # --- S9 interpreter: clean-room default, recorded venv only as last resort ---
+    seed9 = json.load(open(os.path.join(sdir8, "task_seed.json")))
+    venv_bin = os.path.dirname(py)
+    seed9["evidence"] = [{"cmd": "%s/pytest -q tests/test_mod.py" % venv_bin,
+                          "counts": {}, "idx": 1}]
+    with open(os.path.join(sdir8, "task_seed.json"), "w") as f:
+        json.dump(seed9, f)
+    if rep8.get("interpreter_source") != "explicit":
+        fails.append("S9 explicit python should be labelled explicit: %s"
+                     % rep8.get("interpreter_source"))
+    else:
+        # a collectable session must NOT be pushed onto the recorded interpreter
+        rep9 = R.replay_session(sdir8, allow_local_repo=True)
+        if rep9.get("interpreter_source") != "ambient":
+            fails.append("S9 clean interpreter must win when it works: %s"
+                         % rep9.get("interpreter_source"))
+        elif rep9["outcome"] != "red_green":
+            fails.append("S9 ambient run regressed: %s" % rep9["outcome"])
+        else:
+            print("[ok] S9 interpreter: clean-room default kept for collectable ids")
+
+    # --- S10 interpreter fallback: clean one collects nothing -> labelled reuse ---
+    _, _, _, sdir10 = seeded(tmp, "interp", files, {"mod.py": MOD_GREEN})
+    # Shaped like a real venv: bin/python3 is a SYMLINK to the base interpreter.
+    # Comparing realpath here would collapse it onto the ambient python and skip
+    # the fallback entirely — the exact bug this pins.
+    fake_bin = os.path.join(tmp, "session-venv", "bin")
+    os.makedirs(fake_bin, exist_ok=True)
+    fake_py = os.path.join(fake_bin, "python3")
+    if not os.path.lexists(fake_py):
+        os.symlink(py, fake_py)
+    if os.path.realpath(fake_py) != os.path.realpath(py):
+        fails.append("S10 fixture should share a realpath with the ambient python")
+    seed10 = json.load(open(os.path.join(sdir10, "task_seed.json")))
+    seed10["evidence"] = [{"cmd": "%s/pytest -q tests/test_mod.py" % fake_bin,
+                           "counts": {}, "idx": 1}]
+    with open(os.path.join(sdir10, "task_seed.json"), "w") as f:
+        json.dump(seed10, f)
+    real_run = R._run_test
+    dead = {"n": 0}
+
+    def only_clean_is_blind(python_, tree, node_id, timeout_, pythonpath=None):
+        """Simulate 'clean interpreter cannot import the repo's deps'. Keyed on
+        the invocation path, like a venv's site-packages actually is."""
+        if os.path.abspath(python_) == os.path.abspath(py):
+            dead["n"] += 1
+            return "missing"
+        return real_run(python_, tree, node_id, timeout_, pythonpath)
+
+    R._run_test = only_clean_is_blind
+    try:
+        rep10 = R.replay_session(sdir10)
+    finally:
+        R._run_test = real_run
+    if not dead["n"]:
+        fails.append("S10 fixture never exercised the clean interpreter")
+    elif rep10.get("interpreter_source") != "session_recorded":
+        fails.append("S10 should have fallen back: %s / %s"
+                     % (rep10.get("interpreter_source"), rep10["outcome"]))
+    elif not rep10.get("interpreter_fallback_reason"):
+        fails.append("S10 fallback not explained")
+    elif rep10["outcome"] != "red_green" or not rep10["verified"]:
+        fails.append("S10 red/green should still be earned: %s" % rep10["outcome"])
+    else:
+        print("[ok] S10 interpreter fallback: uncollectable -> recorded venv, labelled")
+
     # --- replay_all: batch shape over the store ---
     results = R.replay_all(root=store1, python=py)
     if results.get(sid1, {}).get("outcome") != "red_green":

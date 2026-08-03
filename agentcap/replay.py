@@ -4,9 +4,18 @@ the END state must run all-green and the START state — with the end's test
 files overlaid (the test patch, SWE-bench style) — must not pass. Replaying
 from a bundle, never the live repo, is what makes verified mean
 "self-contained replayable". No dependency install, no docker (L2-, not L3).
+
+Two provenance axes are recorded alongside the verdict, because some repos
+cannot produce a self-contained bundle at all (a blob:none partial clone makes
+`git bundle create` fetch every historical blob from the promisor remote, which
+fails on large repos). With --allow-local-repo the artifact is rebuilt from the
+live local repo instead: red/green is still EARNED by re-execution, but the
+result is only reproducible on this machine. That downgrade is never silent —
+see `artifact_source` / `portability` / `interpreter_source` in the report.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -50,6 +59,57 @@ def _ensure_python(root):
     return py
 
 
+_PY_RE = re.compile(r"(/[^\s'\"]+/bin/)(?:python[0-9.]*|pytest)\b")
+
+
+def _interpreter_from_seed(seed):
+    """The interpreter the session actually ran its tests with, or None.
+
+    The ambient python can import pytest but rarely the repo's third-party
+    deps, so a recorded venv is often the only one that can run the tests at
+    all. Only paths that exist on disk AND can import pytest are returned —
+    never a guess. Reusing it costs the clean-room property, so the caller
+    records `interpreter_source`.
+    """
+    counts = {}
+    for e in seed.get("evidence") or []:
+        for bindir in _PY_RE.findall(e.get("cmd") or ""):
+            for name in ("python3", "python"):
+                cand = os.path.join(bindir, name)
+                if os.path.exists(cand):
+                    counts[cand] = counts.get(cand, 0) + 1
+                    break
+    for cand, _ in sorted(counts.items(), key=lambda kv: -kv[1]):
+        if subprocess.run([cand, "-c", "import pytest"],
+                          capture_output=True).returncode == 0:
+            return cand
+    return None
+
+
+def _is_partial_clone(repo):
+    """True for a blob:none/tree:0 clone — history bundling will hit the remote."""
+    p = subprocess.run(["git", "-C", repo, "config", "--get-regexp",
+                        r"^remote\..*\.partialclonefilter$"], capture_output=True)
+    return p.returncode == 0 and bool(p.stdout.strip())
+
+
+def _artifact_source(session, workdir, allow_local_repo):
+    """-> (source, kind, fallback_reason). A bundle is the honest default; the
+    live repo is a machine-local fallback that must be asked for explicitly."""
+    bundle = os.path.join(workdir, "repo.bundle")
+    try:
+        _bundle(session["repo"], [session["base_sha_start"], session["base_sha_end"]],
+                bundle)
+        return bundle, "bundle", None
+    except Exception as e:
+        if not allow_local_repo:
+            raise
+        reason = "%s: %s" % (type(e).__name__, str(e).strip().splitlines()[0] if str(e).strip() else "")
+        if _is_partial_clone(session["repo"]):
+            reason += " (source is a partial clone)"
+        return session["repo"], "local_repo", reason
+
+
 def _run_test(python, tree, node_id, timeout, pythonpath=None):
     """-> passed | failed | missing | error | timeout, for one node id.
     Per-id runs keep one stale id from aborting the whole batch (pytest
@@ -80,7 +140,8 @@ def _materialize(workdir, name, bundle, capture_dir, cas_root):
     return dest
 
 
-def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None):
+def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None,
+                   allow_local_repo=False):
     """Rebuild the exportable artifact in a temp dir and grade it. Writes
     <session_dir>/replay.json; returns the report (None when no seed)."""
     seed_p = os.path.join(session_dir, "task_seed.json")
@@ -94,23 +155,54 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None):
         "replay_version": REPLAY_VERSION, "outcome": "setup_failed",
         "verified": False, "reason": None, "error": None, "tests": [],
         "overlaid_test_files": [], "python": None,
+        "artifact_source": None, "portability": None,
+        "artifact_fallback_reason": None, "interpreter_source": None,
+        "interpreter_fallback_reason": None,
         "durations": {}, "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
     workdir = tempfile.mkdtemp(prefix="agentcap-replay-")
     try:
+        # The clean-room interpreter stays the default: a session's own venv can
+        # run tests the artifact does not actually declare. It is used only as a
+        # last resort below, when the clean one cannot collect anything at all.
+        fixed_python = bool(python)
         python = python or _ensure_python(os.path.dirname(os.path.dirname(session_dir)))
+        report["interpreter_source"] = "explicit" if fixed_python else "ambient"
         report["python"] = python
-        bundle = os.path.join(workdir, "repo.bundle")
-        _bundle(session["repo"], [session["base_sha_start"], session["base_sha_end"]],
-                bundle)
+
+        source, kind, fb_reason = _artifact_source(session, workdir, allow_local_repo)
+        report["artifact_source"] = kind
+        report["portability"] = "self_contained" if kind == "bundle" else "machine_local"
+        report["artifact_fallback_reason"] = fb_reason
 
         # GREEN first (fail fast): the END state must run every ftp test green
         t0 = time.time()
-        end_tree = _materialize(workdir, "end", bundle,
+        end_tree = _materialize(workdir, "end", source,
                                 os.path.join(session_dir, "env_end"),
                                 session["cas_root"])
         tests = [{"node_id": n, "end_status": _run_test(python, end_tree, n, timeout, pp),
                   "start_status": None} for n in ftp]
+
+        # Nothing collected at all usually means the interpreter cannot import the
+        # repo's third-party deps, not that the ids are stale. Retry once with the
+        # interpreter the session itself used — a labelled downgrade, and the only
+        # way such a repo gets any verdict.
+        if not fixed_python and all(t["end_status"] == "missing" for t in tests):
+            recorded = _interpreter_from_seed(seed)
+            # compare invocation paths, NOT realpath: a venv's bin/python3 is a
+            # symlink to the base interpreter, and it is the invocation path that
+            # gives it its site-packages. realpath would collapse them into one.
+            if recorded and os.path.abspath(recorded) != os.path.abspath(python):
+                retry = [{"node_id": n,
+                          "end_status": _run_test(recorded, end_tree, n, timeout, pp),
+                          "start_status": None} for n in ftp]
+                if any(t["end_status"] != "missing" for t in retry):
+                    tests, python = retry, recorded
+                    report["python"] = recorded
+                    report["interpreter_source"] = "session_recorded"
+                    report["interpreter_fallback_reason"] = (
+                        "clean interpreter collected no fail_to_pass id; reused the "
+                        "interpreter recorded in the session")
         report["durations"]["end_s"] = round(time.time() - t0, 1)
         if any(t["end_status"] == "timeout" for t in tests):
             report.update(tests=tests, reason="timeout")
@@ -119,7 +211,7 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None):
         if runnable and all(t["end_status"] == "passed" for t in runnable):
             # RED: START state + the end's test files overlaid (the test patch)
             t0 = time.time()
-            start_tree = _materialize(workdir, "start", bundle,
+            start_tree = _materialize(workdir, "start", source,
                                       os.path.join(session_dir, "env_start"),
                                       session["cas_root"])
             for rel in seed["test_files"]:
@@ -147,15 +239,18 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None):
         _write(os.path.join(session_dir, "replay.json"), report)
 
 
-def replay_all(root=sess.DEFAULT_ROOT, timeout=DEFAULT_TIMEOUT, python=None):
+def replay_all(root=sess.DEFAULT_ROOT, timeout=DEFAULT_TIMEOUT, python=None,
+               allow_local_repo=False):
     _, sessions_dir = sess._paths(root)
-    python = python or _ensure_python(root)
     results = {}
     for s in sess.list_sessions(root, status="closed"):
         sid = s["session_id"]
         try:
+            # python=None on purpose: each session resolves its own interpreter
+            # (recorded venv first), which _ensure_python cannot do store-wide.
             results[sid] = replay_session(os.path.join(sessions_dir, sid),
-                                          timeout=timeout, python=python)
+                                          timeout=timeout, python=python,
+                                          allow_local_repo=allow_local_repo)
         except Exception as e:  # one bad session must not kill the batch
             results[sid] = {"outcome": "setup_failed", "verified": False,
                             "error": str(e)}

@@ -275,6 +275,9 @@ def export_session(session_dir, out, min_tier="medium"):
         if replay_rep:
             task["verified"] = bool(replay_rep.get("verified"))
             task["replay_outcome"] = replay_rep.get("outcome")
+            # a consumer that needs to rebuild the artifact elsewhere must be able
+            # to tell an earned-but-machine-local verdict from a portable one
+            task["replay_portability"] = replay_rep.get("portability")
         _write(os.path.join(sdir, "task.json"), task)
 
     verify_rep = _load(os.path.join(session_dir, "verify.json")) or {}
@@ -296,7 +299,11 @@ def export_session(session_dir, out, min_tier="medium"):
         "verify": {k: verify_rep.get(k) for k in
                    ("verified", "benchmark_eligible", "join_confidence")},
         "replay": ({"outcome": replay_rep.get("outcome"),
-                    "verified": replay_rep.get("verified")} if replay_rep else None),
+                    "verified": replay_rep.get("verified"),
+                    "portability": replay_rep.get("portability"),
+                    "artifact_source": replay_rep.get("artifact_source"),
+                    "interpreter_source": replay_rep.get("interpreter_source")}
+                   if replay_rep else None),
         "delta": _load(os.path.join(session_dir, "delta.json")),
         "files": {"trajectory": "trajectory.jsonl",
                   "task": "task.json" if task else None, "env": "env/"},
