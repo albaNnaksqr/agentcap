@@ -140,7 +140,7 @@ def _git_blob(repo, oid):
     return p.stdout if p.returncode == 0 else None
 
 
-def _dotenv_hit(env, e, session, hits):
+def _dotenv_hit(env, e, repo, hits):
     """A .env* entry: quarantine on the name only when the file is UNTRACKED.
 
     A tracked .env is already part of the repo we ship inside the artifact, so
@@ -158,7 +158,7 @@ def _dotenv_hit(env, e, session, hits):
         hits.append({"kind": "dotenv_file", "where": where,
                      "reason": "tracked .env not readable as a file"})
         return
-    blob = _git_blob(session.get("repo"), e.get("content_hash"))
+    blob = _git_blob(repo, e.get("content_hash"))
     if blob is None:
         hits.append({"kind": "dotenv_file", "where": where,
                      "reason": "tracked .env whose content could not be read"})
@@ -168,6 +168,13 @@ def _dotenv_hit(env, e, session, hits):
 
 def _redaction_hits(session_dir, session, steps):
     hits = []
+    # objects may live in the parent repo when the capture worktree is gone —
+    # reading through the recorded source is what keeps a tracked .env readable
+    # instead of failing closed on every one of them
+    try:
+        repo, _ = sess.resolve_repo(session)
+    except Exception:
+        repo = session["repo"]
     _scan_text("\n".join(json.dumps(s) for s in steps), "trajectory", hits)
     for env in ("env_start", "env_end"):
         cap = os.path.join(session_dir, env)
@@ -180,7 +187,7 @@ def _redaction_hits(session_dir, session, steps):
         for e in (man or {}).get("entries", []):
             base = e["path"].rsplit("/", 1)[-1]
             if base.startswith(".env") and base not in _ENV_OK:
-                _dotenv_hit(env, e, session, hits)
+                _dotenv_hit(env, e, repo, hits)
             if e.get("untracked") and e["status"] == "present" and e["type"] == "file":
                 bp = _blob_path(session["cas_root"], e["content_hash"])
                 if os.path.exists(bp):

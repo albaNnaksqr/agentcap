@@ -198,6 +198,36 @@ def main():
         else:
             print("[ok] tree snapshot: verifies offline, .gitignore'd tracked files kept")
 
+    # --- capture worktree gone: a tracked .env must still be READ, not failed closed ---
+    parent_e = os.path.join(tmp, "envparent"); os.makedirs(parent_e)
+    for a in (["init","-q"],["config","user.email","t@t"],["config","user.name","t"]):
+        sh("git","-C",parent_e,*a)
+    for rel,c in {"src/a.py":"v=0\n","tests/test_a.py":"def test_x():\n    assert 1\n",
+                  "ui/.env.production":"NODE_ENV=production\n"}.items():
+        write(parent_e, rel, c)
+    sh("git","-C",parent_e,"add","-A"); sh("git","-C",parent_e,"commit","-qm","base")
+    wt_e = os.path.join(tmp, "env-wt")
+    sh("git","-C",parent_e,"worktree","add","-q","--detach",wt_e)
+    store_e = os.path.join(tmp, "envwt_store")
+    sid_e, _ = sess.start_session(wt_e, agent="claude", root=store_e, session_id="claude-E",
+                                  extra={"agent_session_id": "E", "log_path": "/x"})
+    write(wt_e, "src/a.py", "v=1\n")
+    sess.end_session(session_id=sid_e, root=store_e)
+    log_e = os.path.join(tmp, "envwt.jsonl"); claude_log(log_e, wt_e, events)
+    J.set_join(sid_e, {"agent":"claude","session_id":"E","cwd":wt_e,"log_path":log_e,
+                       "first_ts":0,"last_ts":0,"n_steps":len(events)},
+               confidence="high", root=store_e)
+    sh("git","-C",parent_e,"worktree","remove","--force",wt_e)
+    out_e = os.path.join(tmp, "out_envwt")
+    s_e = E.export_all(root=store_e, out=out_e)
+    if sid_e in s_e["quarantined"]:
+        fails.append("tracked .env must be read through the parent repo, not failed closed: %s"
+                     % s_e["quarantined"][sid_e])
+    elif sid_e not in s_e["exported"]:
+        fails.append("session with a deleted worktree should still export: %s" % s_e)
+    else:
+        print("[ok] deleted worktree: tracked .env read via the recorded parent repo")
+
     # --- a manifest written before base_tree_sha existed must still reconstruct ---
     files_old = {"src/a.py": "v=0\n", "tests/test_a.py": "def test_x():\n    assert 1\n"}
     repo_o, store_o, sid_o = build(tmp, "oldman", files_old, {"src/a.py": "v=1\n"}, events)
