@@ -156,6 +156,66 @@ def main():
     else:
         print("[ok] env self-contained: verifies from bundle after repo deleted")
 
+    # --- tree snapshot: bundling impossible -> history-free but still self-contained ---
+    # a tracked file that the repo's own .gitignore matches: litellm has 246 of these,
+    # and a reconstruction that honours .gitignore silently loses every one
+    files_ig = {"src/a.py": "v=0\n", "tests/test_a.py": "def test_x():\n    assert 1\n",
+                ".gitignore": "dist/\nconfig.yaml\n",
+                "cookbook/config.yaml": "tracked despite .gitignore\n",
+                "dist/wheel.txt": "also tracked\n"}
+    repo_t, store_t, sid_t = build(tmp, "treeexp", files_ig, {"src/a.py": "v=1\n"}, events)
+    real_bundle = E._bundle
+
+    def no_bundle(*_a, **_k):
+        raise RuntimeError("HTTP 413 from promisor remote")
+
+    E._bundle = no_bundle
+    try:
+        out_t = os.path.join(tmp, "out_tree")
+        s_t = E.export_all(root=store_t, out=out_t)
+    finally:
+        E._bundle = real_bundle
+    sdir_t = os.path.join(out_t, sid_t)
+    src_meta = json.load(open(os.path.join(sdir_t, "env", "source.json"))) \
+        if os.path.exists(os.path.join(sdir_t, "env", "source.json")) else {}
+    if sid_t not in s_t["exported"]:
+        fails.append("unbundleable session should still export: %s" % s_t)
+    elif src_meta.get("kind") != "tree_snapshot":
+        fails.append("env source should be a tree snapshot: %s" % src_meta)
+    else:
+        shutil.rmtree(repo_t)          # prove it needs nothing but the artifact
+        trees = os.path.join(sdir_t, "env", "trees")
+        blobs_t = os.path.join(sdir_t, "env", "blobs")
+        okt = []
+        for env in ("env_start", "env_end"):
+            cap = os.path.join(sdir_t, "env", env)
+            sha = json.load(open(os.path.join(cap, "manifest.json")))["meta"]["base_sha"]
+            ok, _ = verify(cap, os.path.join(trees, src_meta["trees"][sha]),
+                           cas_root=blobs_t)
+            okt.append(ok)
+        if not all(okt):
+            fails.append("tree snapshot not self-contained: %s" % okt)
+        else:
+            print("[ok] tree snapshot: verifies offline, .gitignore'd tracked files kept")
+
+    # --- a manifest written before base_tree_sha existed must still reconstruct ---
+    files_old = {"src/a.py": "v=0\n", "tests/test_a.py": "def test_x():\n    assert 1\n"}
+    repo_o, store_o, sid_o = build(tmp, "oldman", files_old, {"src/a.py": "v=1\n"}, events)
+    cap_o = os.path.join(store_o, "sessions", sid_o, "env_end")
+    man_p = os.path.join(cap_o, "manifest.json")
+    man_o = json.load(open(man_p))
+    man_o["meta"].pop("base_tree_sha", None)          # v1 manifest
+    with open(man_p, "w") as f:
+        json.dump(man_o, f)
+    tdir = os.path.join(tmp, "oldtrees")
+    trees_o = E._tree_snapshot(repo_o, [man_o["meta"]["base_sha"]], tdir)
+    ok_o, _ = verify(cap_o, os.path.join(tdir, trees_o[man_o["meta"]["base_sha"]]),
+                     cas_root=os.path.join(store_o, "blobs"))
+    if not ok_o:
+        fails.append("pre-base_tree_sha manifest must still reconstruct (no hard gate)")
+    else:
+        print("[ok] legacy manifest without base_tree_sha reconstructs unchecked")
+
     # --- LOW tier is skipped with a reason ---
     _, store2, sid2 = build(tmp, "lo", {"README.md": "hi\n"}, {"README.md": "yo\n"},
                             [("user", "tweak readme"), ("edit", "README.md")])

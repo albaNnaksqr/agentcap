@@ -137,11 +137,13 @@ def main():
     def boom(*_a, **_k):
         raise RuntimeError("HTTP 413 from promisor remote")
 
+    real_tree0 = R._tree_snapshot
     R._bundle = boom
+    R._tree_snapshot = boom          # no self-contained tier available either
     try:
         rep7 = R.replay_session(sdir7, python=py)          # no allow_local_repo
     finally:
-        R._bundle = real_bundle
+        R._bundle, R._tree_snapshot = real_bundle, real_tree0
     if rep7["outcome"] != "setup_failed" or rep7["verified"]:
         fails.append("S7 must NOT fall back without opt-in: %s" % rep7["outcome"])
     elif "413" not in (rep7.get("error") or ""):
@@ -151,13 +153,35 @@ def main():
     else:
         print("[ok] S7 opt-in gate: unbundleable source fails loudly by default")
 
-    # --- S8 forced fallback: source that can never bundle -> machine_local ---
-    repo8, store8, sid8, sdir8 = seeded(tmp, "loc2", files, {"mod.py": MOD_GREEN})
+    # --- S8a unbundleable but archivable -> tree snapshot, still self_contained ---
+    repo8a, store8a, sid8a, sdir8a = seeded(tmp, "tree", files, {"mod.py": MOD_GREEN})
     R._bundle = boom
+    try:
+        rep8a = R.replay_session(sdir8a, python=py)      # no opt-in needed
+    finally:
+        R._bundle = real_bundle
+    if rep8a["outcome"] != "red_green" or not rep8a["verified"]:
+        fails.append("S8a tree snapshot should still earn red_green: %s / %s"
+                     % (rep8a["outcome"], rep8a.get("error")))
+    elif rep8a["artifact_source"] != "tree_snapshot":
+        fails.append("S8a should degrade to a tree snapshot: %s" % rep8a["artifact_source"])
+    elif rep8a["portability"] != "self_contained":
+        fails.append("S8a history-free is still self-contained: %s" % rep8a["portability"])
+    elif "413" not in (rep8a.get("artifact_fallback_reason") or ""):
+        fails.append("S8a bundle failure not explained: %s"
+                     % rep8a.get("artifact_fallback_reason"))
+    else:
+        print("[ok] S8a tree_snapshot: no history, still self_contained, verified")
+
+    # --- S8 forced fallback: neither bundle nor archive -> machine_local ---
+    repo8, store8, sid8, sdir8 = seeded(tmp, "loc2", files, {"mod.py": MOD_GREEN})
+    real_tree = R._tree_snapshot
+    R._bundle = boom
+    R._tree_snapshot = boom
     try:
         rep8 = R.replay_session(sdir8, python=py, allow_local_repo=True)
     finally:
-        R._bundle = real_bundle
+        R._bundle, R._tree_snapshot = real_bundle, real_tree
     if rep8["outcome"] != "red_green" or not rep8["verified"]:
         fails.append("S8 red/green must still be earned via local repo: %s" % rep8["outcome"])
     elif rep8["artifact_source"] != "local_repo" or rep8["portability"] != "machine_local":

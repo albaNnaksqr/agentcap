@@ -30,6 +30,11 @@ def head_sha(repo):
     return out(repo, "rev-parse", "HEAD").strip()
 
 
+def tree_sha(repo, rev="HEAD"):
+    """Tree object of a commit: content identity, independent of history."""
+    return out(repo, "rev-parse", "%s^{tree}" % rev).strip()
+
+
 def current_branch(repo):
     rc, o, _ = run(repo, "rev-parse", "--abbrev-ref", "HEAD")
     return o.strip() if rc == 0 else ""

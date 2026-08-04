@@ -80,6 +80,11 @@ def snapshot(repo, capture_dir, cas_root=None):
         "manifest_version": MANIFEST_VERSION,
         "hash_algo": "git-blob-" + g.object_format(repo),
         "base_sha": base_sha,
+        # Content identity of the base commit. A history-free artifact (a tree
+        # snapshot) cannot reproduce base_sha — a commit without parents hashes
+        # differently — but it can reproduce the tree, so this is what a
+        # reconstruction is checked against. Absent in manifests written before v2.
+        "base_tree_sha": g.tree_sha(repo, base_sha),
         "branch": g.current_branch(repo),
         "deleted": g.deleted_tracked(repo),        # derived metadata only, not a reconstruction op
         "snapshot_inconsistent": inconsistent,

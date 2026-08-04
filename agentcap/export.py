@@ -209,10 +209,46 @@ def _bundle(repo, shas, dest):
             g.run(repo, "update-ref", "-d", ref)
 
 
+TREE_SNAPSHOT = "repo.tar.gz"
+
+
+def _tree_snapshot(repo, shas, dest):
+    """Self-contained artifact for repos that cannot be bundled.
+
+    `git bundle create` packs every object reachable from the refs, so a
+    blob:none partial clone refetches its whole history from the promisor remote
+    and fails on anything large. Replay only ever checks out ONE commit and
+    applies diffs on top, so history is dead weight: ship the base trees instead.
+    Still self-contained — every byte needed is in the tarball — but history-free,
+    so the reconstruction is checked against base_tree_sha, not base_sha.
+    """
+    os.makedirs(dest, exist_ok=True)
+    written = {}
+    for sha in dict.fromkeys(shas):
+        path = os.path.join(dest, "%s.tar.gz" % sha)
+        with open(path, "wb") as f:
+            p = subprocess.Popen(["git", "-C", repo, "archive", "--format=tar.gz", sha],
+                                 stdout=f, stderr=subprocess.PIPE)
+            _, err = p.communicate()
+        if p.returncode != 0:
+            raise RuntimeError("git archive %s failed: %s"
+                               % (sha, err.decode(errors="ignore").strip()))
+        written[sha] = os.path.basename(path)
+    return written
+
+
 def _pack_env(session_dir, session, dest):
     os.makedirs(os.path.join(dest, "blobs"), exist_ok=True)
-    _bundle(session["repo"], [session["base_sha_start"], session["base_sha_end"]],
-            os.path.join(dest, "repo.bundle"))
+    shas = [session["base_sha_start"], session["base_sha_end"]]
+    try:
+        _bundle(session["repo"], shas, os.path.join(dest, "repo.bundle"))
+        source = {"kind": "bundle", "path": "repo.bundle"}
+    except Exception as e:
+        # keep self-containment, drop history — see _tree_snapshot
+        trees = _tree_snapshot(session["repo"], shas, os.path.join(dest, "trees"))
+        source = {"kind": "tree_snapshot", "trees": trees,
+                  "bundle_error": str(e).strip().splitlines()[0] if str(e).strip() else ""}
+    _write(os.path.join(dest, "source.json"), source)
     for env in ("env_start", "env_end"):
         src, dst = os.path.join(session_dir, env), os.path.join(dest, env)
         os.makedirs(dst, exist_ok=True)
@@ -296,7 +332,7 @@ def export_session(session_dir, out, min_tier="medium"):
         _pack_env(session_dir, session, os.path.join(sdir, "env"))
     except Exception as e:
         shutil.rmtree(sdir, ignore_errors=True)
-        return "skipped", "bundle_failed: %s" % e
+        return "skipped", "env_pack_failed: %s" % e
 
     # sanitize: the absolute repo path must not leave the machine
     repo_abs = os.path.abspath(session["repo"])

@@ -30,15 +30,45 @@ def _apply(dest, diff_path):
         raise RuntimeError("git apply %s failed: %s" % (diff_path, p.stderr.strip()))
 
 
-def reconstruct(capture_dir, source_repo, dest, cas_root=None):
+def _materialize_tree(tarball, dest, want_tree_sha):
+    """Lay down a history-free base from `git archive` output.
+
+    `git add -A` alone is NOT enough: it honours the .gitignore that just came out
+    of the tarball, and repos do track files their own ignore rules match (litellm
+    tracks `cookbook/misc/config.yaml` against `.gitignore:92` — 246 such paths).
+    Without --force those files silently vanish from the reconstruction. --force is
+    load-bearing; do not drop it.
+    """
+    os.makedirs(dest, exist_ok=True)
+    subprocess.run(["tar", "-xzf", tarball, "-C", dest], check=True, capture_output=True)
+    for args in (["init", "-q"], ["config", "user.email", "agentcap@local"],
+                 ["config", "user.name", "agentcap"], ["add", "-A", "--force"]):
+        subprocess.run(["git", "-C", dest] + args, check=True, capture_output=True)
+    got = subprocess.run(["git", "-C", dest, "write-tree"], check=True,
+                         capture_output=True, text=True).stdout.strip()
+    if want_tree_sha and got != want_tree_sha:
+        raise RuntimeError("tree snapshot mismatch: expected %s, rebuilt %s"
+                           % (want_tree_sha, got))
+    subprocess.run(["git", "-C", dest, "commit", "-q", "-m", "agentcap base snapshot",
+                    "--no-verify"], check=True, capture_output=True)
+    return got
+
+
+def reconstruct(capture_dir, source, dest, cas_root=None):
+    """`source` is a git repo/bundle path, or a `git archive` tarball (tree snapshot).
+    A tarball carries no history, so the base is verified by tree hash instead of by
+    checking out base_sha."""
     man = load_manifest(capture_dir)
     base_sha = man["meta"]["base_sha"]
     cas = CAS(cas_root or os.path.join(capture_dir, "blobs"))
 
-    subprocess.run(["git", "clone", "--quiet", source_repo, dest],
-                   check=True, capture_output=True)
-    subprocess.run(["git", "-C", dest, "checkout", "--quiet", "--detach", base_sha],
-                   check=True, capture_output=True)
+    if str(source).endswith((".tar.gz", ".tgz")):
+        _materialize_tree(source, dest, man["meta"].get("base_tree_sha"))
+    else:
+        subprocess.run(["git", "clone", "--quiet", source, dest],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", dest, "checkout", "--quiet", "--detach", base_sha],
+                       check=True, capture_output=True)
 
     # tracked final content = base + staged(HEAD->index) + unstaged(index->worktree)
     _apply(dest, os.path.join(capture_dir, "staged.diff"))

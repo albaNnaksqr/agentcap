@@ -5,13 +5,20 @@ files overlaid (the test patch, SWE-bench style) — must not pass. Replaying
 from a bundle, never the live repo, is what makes verified mean
 "self-contained replayable". No dependency install, no docker (L2-, not L3).
 
-Two provenance axes are recorded alongside the verdict, because some repos
-cannot produce a self-contained bundle at all (a blob:none partial clone makes
-`git bundle create` fetch every historical blob from the promisor remote, which
-fails on large repos). With --allow-local-repo the artifact is rebuilt from the
-live local repo instead: red/green is still EARNED by re-execution, but the
-result is only reproducible on this machine. That downgrade is never silent —
-see `artifact_source` / `portability` / `interpreter_source` in the report.
+Provenance is recorded alongside the verdict, because some repos cannot produce a
+bundle at all (a blob:none partial clone makes `git bundle create` refetch every
+historical blob from the promisor remote, which fails on large repos). The source
+of the artifact degrades in tiers, and the tier is always stated:
+
+  bundle         full history, self-contained
+  tree_snapshot  base trees only (`git archive`), still self-contained but
+                 history-free — so the base is checked by tree hash, not by
+                 checking out base_sha
+  local_repo     the live repo; red/green is still EARNED, but only reproducible
+                 on this machine, so portability drops to machine_local. Opt-in.
+
+See `artifact_source` / `portability` / `artifact_fallback_reason` /
+`interpreter_source` in the report.
 """
 import json
 import os
@@ -24,7 +31,7 @@ import time
 
 from . import session as sess
 from . import testparse
-from .export import _bundle
+from .export import _bundle, _tree_snapshot
 from .verify import reconstruct
 
 REPLAY_VERSION = 1
@@ -95,20 +102,32 @@ def _is_partial_clone(repo):
 
 
 def _artifact_source(session, workdir, allow_local_repo):
-    """-> (source, kind, fallback_reason). A bundle is the honest default; the
-    live repo is a machine-local fallback that must be asked for explicitly."""
+    """-> (source, kind, fallback_reason), best tier first:
+
+      bundle        full history, self-contained
+      tree_snapshot base trees only, still self-contained (no history)
+      local_repo    the live repo — machine-local, must be opted into
+
+    `source` may be a per-sha mapping when the tier needs one artifact per base.
+    """
+    shas = [session["base_sha_start"], session["base_sha_end"]]
     bundle = os.path.join(workdir, "repo.bundle")
     try:
-        _bundle(session["repo"], [session["base_sha_start"], session["base_sha_end"]],
-                bundle)
+        _bundle(session["repo"], shas, bundle)
         return bundle, "bundle", None
     except Exception as e:
-        if not allow_local_repo:
-            raise
-        reason = "%s: %s" % (type(e).__name__, str(e).strip().splitlines()[0] if str(e).strip() else "")
+        reason = "%s: %s" % (type(e).__name__,
+                             str(e).strip().splitlines()[0] if str(e).strip() else "")
         if _is_partial_clone(session["repo"]):
             reason += " (source is a partial clone)"
-        return session["repo"], "local_repo", reason
+    try:
+        trees = _tree_snapshot(session["repo"], shas, os.path.join(workdir, "trees"))
+        return trees, "tree_snapshot", reason
+    except Exception as e2:
+        reason += " | tree snapshot failed: %s" % e2
+    if not allow_local_repo:
+        raise RuntimeError(reason)
+    return session["repo"], "local_repo", reason
 
 
 _PRUNE = {".git", "node_modules", "__pycache__", ".venv", "venv"}
@@ -193,9 +212,16 @@ def _run_test(python, tree, node_id, timeout, pythonpath=None):
     return "error"
 
 
-def _materialize(workdir, name, bundle, capture_dir, cas_root):
+def _materialize(workdir, name, source, capture_dir, cas_root, base_sha=None):
+    """source: one path (repo/bundle), or {sha: filename} for a tree snapshot, in
+    which case the artifact for THIS capture's base is selected."""
+    if isinstance(source, dict):
+        fn = source.get(base_sha)
+        if not fn:
+            raise RuntimeError("no tree snapshot for base %s" % base_sha)
+        source = os.path.join(workdir, "trees", fn)
     dest = os.path.join(workdir, name)
-    reconstruct(capture_dir, bundle, dest, cas_root)
+    reconstruct(capture_dir, source, dest, cas_root)
     return dest
 
 
@@ -231,14 +257,15 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None,
 
         source, kind, fb_reason = _artifact_source(session, workdir, allow_local_repo)
         report["artifact_source"] = kind
-        report["portability"] = "self_contained" if kind == "bundle" else "machine_local"
+        report["portability"] = ("machine_local" if kind == "local_repo"
+                                 else "self_contained")
         report["artifact_fallback_reason"] = fb_reason
 
         # GREEN first (fail fast): the END state must run every ftp test green
         t0 = time.time()
         end_tree = _materialize(workdir, "end", source,
                                 os.path.join(session_dir, "env_end"),
-                                session["cas_root"])
+                                session["cas_root"], session["base_sha_end"])
         tests = [{"node_id": n, "runner": runner_for(n),
                   "end_status": _run_test(python, end_tree, n, timeout, pp),
                   "start_status": None} for n in ftp]
@@ -273,7 +300,7 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None,
             t0 = time.time()
             start_tree = _materialize(workdir, "start", source,
                                       os.path.join(session_dir, "env_start"),
-                                      session["cas_root"])
+                                      session["cas_root"], session["base_sha_start"])
             for rel in seed["test_files"]:
                 src = os.path.join(end_tree, rel)
                 if not os.path.exists(src):
