@@ -39,7 +39,15 @@ def _pythonpath_components(cmd, cwd):
     the reconstructed tree (not an installed copy). Agents commonly run e.g.
     `PYTHONPATH=$PWD/python pytest ...` for a src/ or python/ package layout.
     `$PWD`/absolute paths under the worktree are made relative; machine-specific
-    absolute paths (site-packages, ...) are dropped."""
+    absolute paths (site-packages, ...) are dropped.
+
+    `$REPO_ROOT` counts as a repo-root alias too: prepared-runtime instructions
+    commonly define `REPO_ROOT="$(git rev-parse --show-toplevel)"` and run
+    `PYTHONPATH="$REPO_ROOT/python" ...`. Left unexpanded it survives into the seed
+    as the literal string, replay then sets a PYTHONPATH that points nowhere, and
+    an installed copy of the package silently shadows the reconstructed tree — the
+    tests pass or fail against the WRONG code. Observed on sglang#33504/#33505,
+    which replayed as not_green while the same tests were green in the worktree."""
     m = _PP_RE.search(cmd or "")
     if not m:
         return []
@@ -47,7 +55,9 @@ def _pythonpath_components(cmd, cwd):
     cwd = (cwd or "").rstrip("/")
     out = []
     for raw in val.split(":"):
-        c = raw.replace("${PWD}", cwd).replace("$PWD", cwd).strip()
+        c = raw.strip()
+        for alias in ("${PWD}", "$PWD", "${REPO_ROOT}", "$REPO_ROOT"):
+            c = c.replace(alias, cwd)
         if not c:
             continue
         if os.path.isabs(c):

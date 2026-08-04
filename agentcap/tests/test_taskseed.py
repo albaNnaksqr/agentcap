@@ -149,6 +149,14 @@ def main():
     pp3 = T._pythonpath_components('PYTHONPATH=/opt/site-packages pytest x::y', cwd)
     if pp3 != []:
         fails.append("pythonpath outside worktree should be dropped, got %s" % pp3)
+    # $REPO_ROOT is a repo-root alias: left literal, replay points PYTHONPATH at
+    # nothing and an installed copy shadows the reconstructed tree
+    pp4 = T._pythonpath_components('PYTHONPATH="$REPO_ROOT/python" pytest a::b', cwd)
+    if pp4 != ["python"]:
+        fails.append("pythonpath $REPO_ROOT/python -> ['python'], got %s" % pp4)
+    pp5 = T._pythonpath_components('PYTHONPATH=${REPO_ROOT} pytest a::b', cwd)
+    if pp5 != ["."]:
+        fails.append("pythonpath ${REPO_ROOT} -> ['.'], got %s" % pp5)
     if any(f.startswith("pythonpath") for f in fails):
         pass
     else:
