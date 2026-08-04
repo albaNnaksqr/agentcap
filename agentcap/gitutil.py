@@ -1,5 +1,6 @@
 """Thin git helpers. All content hashing goes through git so we get git-normalized
 blob OIDs (the v0.2 fidelity contract: normalized blob content, not exact disk bytes)."""
+import os
 import subprocess
 
 
@@ -28,6 +29,21 @@ def object_format(repo):
 
 def head_sha(repo):
     return out(repo, "rev-parse", "HEAD").strip()
+
+
+def object_source(repo):
+    """For a linked worktree, the repo that actually holds the objects; None for a
+    normal repo. Batch harnesses capture inside throwaway worktrees, and once the
+    worktree is deleted nothing can bundle or archive that base again — recording
+    the parent is what keeps such a session replayable."""
+    try:
+        cd = out(repo, "rev-parse", "--git-common-dir").strip()
+    except Exception:
+        return None
+    if not os.path.isabs(cd):
+        cd = os.path.abspath(os.path.join(repo, cd))
+    parent = os.path.dirname(cd) if os.path.basename(cd) == ".git" else cd
+    return parent if os.path.abspath(parent) != os.path.abspath(repo) else None
 
 
 def tree_sha(repo, rev="HEAD"):

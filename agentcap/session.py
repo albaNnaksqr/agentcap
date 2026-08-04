@@ -14,6 +14,7 @@ import json
 import os
 import uuid
 
+from . import gitutil as g
 from .snapshot import snapshot, load_manifest
 from .verify import verify as verify_capture
 
@@ -36,6 +37,25 @@ def _write_json(path, obj):
 
 def _paths(root):
     return os.path.join(root, "blobs"), os.path.join(root, "sessions")
+
+
+def resolve_repo(session):
+    """-> (path, fell_back). The repo a consumer should read objects from.
+
+    Captures taken inside a throwaway worktree name that worktree as `repo`, and
+    batch harnesses delete those (run_batch.py --rm-worktree does it by default in
+    some flows). The recorded parent still holds every object, so fall back to it
+    rather than declaring the session unreplayable. Never rewrite session["repo"]:
+    it is where the capture happened, not where the objects live today.
+    """
+    repo = session["repo"]
+    if os.path.isdir(repo):
+        return repo, False
+    alt = session.get("repo_object_source")
+    if alt and os.path.isdir(alt):
+        return alt, True
+    raise RuntimeError("repo gone and no usable object source: %s (recorded parent: %s)"
+                       % (repo, alt))
 
 
 def start_session(repo, agent="manual", confidence="high", root=DEFAULT_ROOT,
@@ -63,6 +83,9 @@ def start_session(repo, agent="manual", confidence="high", root=DEFAULT_ROOT,
         "base_sha_start": meta["base_sha"],
         "base_sha_end": None,
         "cas_root": blobs,
+        # None for a normal repo; for a throwaway worktree, the repo holding the
+        # objects — the only thing that can rebuild this base once it is deleted.
+        "repo_object_source": g.object_source(repo),
         "extra": extra or {},
     }
     _write_json(os.path.join(sdir, "session.json"), session)
@@ -175,7 +198,10 @@ def verify_session(session_id, root=DEFAULT_ROOT):
     _, sessions = _paths(root)
     sdir = os.path.join(sessions, session_id)
     session = json.load(open(os.path.join(sdir, "session.json")))
-    repo, blobs = session["repo"], session["cas_root"]
+    # same reason as replay: a deleted capture worktree must not make an already
+    # captured session unverifiable when the parent repo still has the objects
+    repo, _ = resolve_repo(session)
+    blobs = session["cas_root"]
     ok_s, rep_s = verify_capture(os.path.join(sdir, "env_start"), repo, cas_root=blobs)
     ok_e, rep_e = verify_capture(os.path.join(sdir, "env_end"), repo, cas_root=blobs)
 

@@ -111,23 +111,25 @@ def _artifact_source(session, workdir, allow_local_repo):
     `source` may be a per-sha mapping when the tier needs one artifact per base.
     """
     shas = [session["base_sha_start"], session["base_sha_end"]]
+    repo, fell_back = sess.resolve_repo(session)
+    prefix = "capture worktree is gone; read objects from %s | " % repo if fell_back else ""
     bundle = os.path.join(workdir, "repo.bundle")
     try:
-        _bundle(session["repo"], shas, bundle)
-        return bundle, "bundle", None
+        _bundle(repo, shas, bundle)
+        return bundle, "bundle", (prefix or None)
     except Exception as e:
-        reason = "%s: %s" % (type(e).__name__,
-                             str(e).strip().splitlines()[0] if str(e).strip() else "")
-        if _is_partial_clone(session["repo"]):
+        reason = prefix + "%s: %s" % (type(e).__name__,
+                                      str(e).strip().splitlines()[0] if str(e).strip() else "")
+        if _is_partial_clone(repo):
             reason += " (source is a partial clone)"
     try:
-        trees = _tree_snapshot(session["repo"], shas, os.path.join(workdir, "trees"))
+        trees = _tree_snapshot(repo, shas, os.path.join(workdir, "trees"))
         return trees, "tree_snapshot", reason
     except Exception as e2:
         reason += " | tree snapshot failed: %s" % e2
     if not allow_local_repo:
         raise RuntimeError(reason)
-    return session["repo"], "local_repo", reason
+    return repo, "local_repo", reason
 
 
 _PRUNE = {".git", "node_modules", "__pycache__", ".venv", "venv"}

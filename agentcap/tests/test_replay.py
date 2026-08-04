@@ -310,6 +310,65 @@ def main():
         else:
             print("[ok] S11 import root derived from the tree; unknown id stays missing")
 
+    # --- S12 disposable worktree: capture in one, delete it, still replayable ---
+    parent = os.path.join(tmp, "wtparent")
+    os.makedirs(parent)
+    for a in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+        subprocess.run(["git", "-C", parent] + a, check=True, capture_output=True)
+    for rel, c in {"mod.py": MOD_RED, "tests/test_mod.py": TEST_F}.items():
+        p = os.path.join(parent, rel)
+        os.makedirs(os.path.dirname(p) or parent, exist_ok=True)
+        open(p, "w").write(c)
+    for a in (["add", "-A"], ["commit", "-qm", "base"]):
+        subprocess.run(["git", "-C", parent] + a, check=True, capture_output=True)
+    wt = os.path.join(tmp, "throwaway-wt")
+    subprocess.run(["git", "-C", parent, "worktree", "add", "-q", "--detach", wt],
+                   check=True, capture_output=True)
+
+    store12 = os.path.join(tmp, "wt_store")
+    from agentcap import taskseed as T3
+    from agentcap import join as J3
+    sid12, s12 = sess.start_session(wt, agent="claude", root=store12, session_id="claude-W",
+                                    extra={"agent_session_id": "W", "log_path": "/x"})
+    if s12.get("repo_object_source") != os.path.realpath(parent) and \
+            s12.get("repo_object_source") != parent:
+        fails.append("S12 parent repo not recorded: %s" % s12.get("repo_object_source"))
+    open(os.path.join(wt, "mod.py"), "w").write(MOD_GREEN)
+    sess.end_session(session_id=sid12, root=store12)
+    log12 = os.path.join(tmp, "wt.jsonl")
+    claude_log(log12, wt, EVENTS)
+    J3.set_join(sid12, {"agent": "claude", "session_id": "W", "cwd": wt, "log_path": log12,
+                        "first_ts": 0, "last_ts": 0, "n_steps": len(EVENTS)},
+                confidence="high", root=store12)
+    sdir12 = os.path.join(store12, "sessions", sid12)
+    T3.extract_seed(sdir12)
+    subprocess.run(["git", "-C", parent, "worktree", "remove", "--force", wt],
+                   check=True, capture_output=True)      # the harness throws it away
+    if os.path.exists(wt):
+        fails.append("S12 fixture: worktree not actually gone")
+    else:
+        rep12 = R.replay_session(sdir12, python=py)
+        if rep12["outcome"] != "red_green" or not rep12["verified"]:
+            fails.append("S12 deleted worktree should still replay: %s / %s"
+                         % (rep12["outcome"], rep12.get("error")))
+        elif "worktree is gone" not in (rep12.get("artifact_fallback_reason") or ""):
+            fails.append("S12 fallback to the parent repo not recorded: %s"
+                         % rep12.get("artifact_fallback_reason"))
+        else:
+            print("[ok] S12 disposable worktree: replays from the recorded parent repo")
+
+    # a session with neither the worktree nor a recorded parent must fail loudly
+    s12_no = json.load(open(os.path.join(sdir12, "session.json")))
+    s12_no["repo_object_source"] = None
+    with open(os.path.join(sdir12, "session.json"), "w") as f:
+        json.dump(s12_no, f)
+    rep12b = R.replay_session(sdir12, python=py)
+    if rep12b["outcome"] != "setup_failed" or "no usable object source" not in (
+            rep12b.get("error") or ""):
+        fails.append("S12 legacy session without a parent must fail loudly: %s" % rep12b)
+    else:
+        print("[ok] S12 no worktree and no recorded parent -> loud setup_failed")
+
     # --- replay_all: batch shape over the store ---
     results = R.replay_all(root=store1, python=py)
     if results.get(sid1, {}).get("outcome") != "red_green":

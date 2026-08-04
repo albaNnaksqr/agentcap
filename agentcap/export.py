@@ -240,14 +240,17 @@ def _tree_snapshot(repo, shas, dest):
 def _pack_env(session_dir, session, dest):
     os.makedirs(os.path.join(dest, "blobs"), exist_ok=True)
     shas = [session["base_sha_start"], session["base_sha_end"]]
+    repo, fell_back = sess.resolve_repo(session)
     try:
-        _bundle(session["repo"], shas, os.path.join(dest, "repo.bundle"))
+        _bundle(repo, shas, os.path.join(dest, "repo.bundle"))
         source = {"kind": "bundle", "path": "repo.bundle"}
     except Exception as e:
         # keep self-containment, drop history — see _tree_snapshot
-        trees = _tree_snapshot(session["repo"], shas, os.path.join(dest, "trees"))
+        trees = _tree_snapshot(repo, shas, os.path.join(dest, "trees"))
         source = {"kind": "tree_snapshot", "trees": trees,
                   "bundle_error": str(e).strip().splitlines()[0] if str(e).strip() else ""}
+    if fell_back:
+        source["read_from_object_source"] = True
     _write(os.path.join(dest, "source.json"), source)
     for env in ("env_start", "env_end"):
         src, dst = os.path.join(session_dir, env), os.path.join(dest, env)
