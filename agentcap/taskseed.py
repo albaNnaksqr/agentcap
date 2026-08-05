@@ -120,6 +120,44 @@ def _timeline(runs):
     return ftp, ptp, evidence
 
 
+_ADDED_TEST_RE = re.compile(r"^\+\s*(?:async\s+)?def\s+(test_\w+)", re.M)
+
+
+def _added_test_names(session_dir):
+    """Test functions this session ADDED, read from the end-state diffs.
+
+    Observing a node go red then green is not enough to call it the task: a broad
+    run can mark tests red that are simply never run again (they did not turn
+    green, they vanished), and an environment error can red-then-green an entire
+    file at once. Both were seen in one day — litellm#35793 dragged in three
+    long-standing failures from a `pytest tests/litellm/test_*.py` sweep, and
+    litellm#35531 swept in eight pre-existing tests whose file had errored at
+    collection before prisma was installed.
+
+    A test the session wrote is a much stronger statement of intent than a flip
+    it merely witnessed. Returns bare function names (node ids are compared on
+    their last segment, so this covers pytest, class-scoped and unittest ids).
+    """
+    names = set()
+    for env in ("env_end", "env_start"):
+        for diff in ("staged.diff", "unstaged.diff"):
+            p = os.path.join(session_dir, env, diff)
+            if not os.path.exists(p):
+                continue
+            try:
+                text = open(p, "rb").read().decode(errors="ignore")
+            except OSError:
+                continue
+            names |= set(_ADDED_TEST_RE.findall(text))
+    return names
+
+
+def _node_func(node):
+    """Last segment of a node id, without a parametrization suffix."""
+    seg = node.split("::")[-1].split(".")[-1]
+    return seg.split("[", 1)[0]
+
+
 def _node_path(node, end_paths):
     """The repo file a node id lives in, or None when it cannot be pinned.
 
@@ -168,6 +206,16 @@ def extract_seed(session_dir):
     ftp = {n for n in ftp if node_paths.get(n)}
     ptp = {n for n in ptp if node_paths.get(n)}
 
+    # Prefer the tests this session wrote over every flip it merely witnessed —
+    # see _added_test_names. Only narrows when the session added a test that is
+    # actually among the observed flips; a session that fixed a pre-existing test
+    # without writing one keeps the observed set, which is all it has.
+    added_tests = _added_test_names(session_dir)
+    authored = {n for n in ftp if _node_func(n) in added_tests}
+    dropped_observed = sorted(ftp - authored) if authored else []
+    if authored:
+        ftp = authored
+
     changed = sorted(set(delta["added"]) | set(delta["modified"]))
     test_files = sorted({node_paths[n] for n in (ftp | ptp)}
                         | {c for c in changed if _looks_test(c)})
@@ -208,6 +256,10 @@ def extract_seed(session_dir):
         "test_pythonpath": test_pythonpath,  # repo-relative; [] -> replay uses "."
         "source_delta": source_delta,
         "test_only_delta": test_only,       # a flag, not a verdict
+        # transparency for the narrowing above: what the session wrote, and which
+        # merely-observed flips were set aside because of it
+        "authored_tests": sorted(added_tests),
+        "dropped_observed_ftp": dropped_observed,
         "evidence": evidence,
         "verified": False,   # we did not run anything — observed evidence only
     }

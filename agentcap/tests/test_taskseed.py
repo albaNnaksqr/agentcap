@@ -48,7 +48,8 @@ def claude_log(path, cwd, runs):
             f.write(json.dumps(ln) + "\n")
 
 
-def build_session(tmp, name, source_fix, log_runs):
+def build_session(tmp, name, source_fix, log_runs, extra_end_files=None,
+                  extra_base_files=None):
     """A real env session (start/end snapshot) + a fabricated joined trajectory."""
     repo = os.path.join(tmp, name)
     store = os.path.join(tmp, name + "_store")
@@ -56,6 +57,8 @@ def build_session(tmp, name, source_fix, log_runs):
     git(repo, "init", "-q"); git(repo, "config", "user.email", "t@t"); git(repo, "config", "user.name", "t")
     write(repo, "src/mod.py", "def f():\n    return 0\n")
     write(repo, "tests/test_mod.py", "from src.mod import f\ndef test_f():\n    assert f() == 1\n")
+    for rel, c in (extra_base_files or {}).items():        # pre-existing, NOT authored
+        write(repo, rel, c)
     git(repo, "add", "-A"); git(repo, "commit", "-qm", "base (test red)")
 
     sid, _ = sess.start_session(repo, agent="claude", root=store, session_id="claude-S",
@@ -66,6 +69,8 @@ def build_session(tmp, name, source_fix, log_runs):
     else:
         write(repo, "tests/test_mod.py",                          # gamed: edit the test
               "from src.mod import f\ndef test_f():\n    assert f() == 0\n")
+    for rel, c in (extra_end_files or {}).items():                # e.g. an authored test
+        write(repo, rel, c)
     sess.end_session(session_id=sid, root=store)
 
     log = os.path.join(tmp, name + ".jsonl")
@@ -201,6 +206,66 @@ def main():
         fails.append("source_delta wrong: %s" % seed_u["source_delta"])
     else:
         print("[ok] unittest red->green session seeds a grounded dotted FTP")
+
+    # --- authored tests win over merely-observed flips ---
+    # the session writes test_f; a broad run also reds two pre-existing tests that
+    # are never run again (litellm#35793) — those must not become the task
+    RED_BROAD = ("tests/test_mod.py::test_f_extra FAILED\n"
+                 "tests/test_other.py::test_legacy_a FAILED\n"
+                 "tests/test_other.py::test_legacy_b FAILED\n"
+                 "=== 3 failed in 0.3s ===")
+    GREEN_ONE = "tests/test_mod.py::test_f_extra PASSED\n=== 1 passed in 0.1s ==="
+    sdir_a = build_session(tmp, "authored", source_fix=True,
+                           log_runs=[("python -m pytest -q", RED_BROAD),
+                                     ("python -m pytest -q tests/test_mod.py", GREEN_ONE)],
+                           extra_base_files={"tests/test_other.py":
+                                             "def test_legacy_a():\n    assert 1\n"
+                                             "def test_legacy_b():\n    assert 1\n"},
+                           extra_end_files={"tests/test_mod.py":
+                                            "from src.mod import f\n"
+                                            "def test_f():\n    assert f() == 1\n"
+                                            "def test_f_extra():\n    assert f() == 1\n"})
+    seed_a = T.extract_seed(sdir_a)
+    if not seed_a:
+        fails.append("authored-filter fixture produced no seed")
+    else:
+        got = seed_a["candidate_fail_to_pass"]
+        if seed_a["authored_tests"]:
+            # test_f is authored -> the two legacy ids must be gone
+            if got != ["tests/test_mod.py::test_f_extra"]:
+                fails.append("authored test should be the only ftp: %s" % got)
+            elif "tests/test_other.py::test_legacy_a" not in seed_a["dropped_observed_ftp"]:
+                fails.append("dropped observed flips not recorded: %s"
+                             % seed_a["dropped_observed_ftp"])
+            else:
+                print("[ok] authored test wins; merely-observed flips recorded as dropped")
+        else:
+            # nothing authored in this fixture -> behaviour must be unchanged
+            if "tests/test_mod.py::test_f_extra" not in got:
+                fails.append("no authored tests -> observed ftp must be kept: %s" % got)
+            else:
+                print("[ok] no authored test -> observed flips kept (fallback intact)")
+
+    # the diff parser itself: only ADDED test defs count
+    import tempfile as _tf
+    d = _tf.mkdtemp(dir=tmp)
+    os.makedirs(os.path.join(d, "env_end"))
+    with open(os.path.join(d, "env_end", "unstaged.diff"), "w") as f:
+        f.write("--- a/tests/t.py\n+++ b/tests/t.py\n"
+                "+def test_added():\n+    assert 1\n"
+                "-def test_removed():\n"
+                " def test_untouched():\n"
+                "+    async def test_async_added():\n")
+    names = T._added_test_names(d)
+    if names != {"test_added", "test_async_added"}:
+        fails.append("added-test extraction wrong: %s" % sorted(names))
+    elif T._node_func("tests/t.py::Case::test_x[param-1]") != "test_x":
+        fails.append("node func extraction wrong: %s"
+                     % T._node_func("tests/t.py::Case::test_x[param-1]"))
+    elif T._node_func("pkg.mod.Case.test_y") != "test_y":
+        fails.append("dotted node func extraction wrong")
+    else:
+        print("[ok] added-test extraction: additions only, params and dotted ids handled")
 
     print("-" * 50)
     if fails:
