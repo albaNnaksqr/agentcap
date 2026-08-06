@@ -61,6 +61,58 @@ def agentcap_env(args) -> dict:
     return env
 
 
+def _subject(title: str, limit: int) -> str:
+    """Commit subject that survives being read. A hard slice cuts mid-sentence —
+    `fix: spend logs silently dropped when a provider returns` lost the clause that
+    said what was wrong with it — so trim at a word boundary and mark the cut."""
+    title = " ".join(title.split())
+    if len(title) <= limit:
+        return title
+    cut = title[:limit - 1].rsplit(" ", 1)[0].rstrip(" ,.;:—-")
+    return (cut or title[:limit - 1]) + "…"
+
+
+def promote_to_branch(repo: str, wt: str, item: dict, pack: str, rec: dict) -> dict:
+    """Package a captured session as a PR-ready local branch. Runs AFTER mark-end.
+
+    Two rules make this safe to bolt onto a capture harness:
+
+    - The AGENT never commits (the contract says so): committing mid-session empties
+      the diffs agentcap reads to tell which tests the session authored. The harness
+      commits here instead, once the capture boundary has closed, so measurement sees
+      the working tree it expects and contribution still gets a real commit.
+    - Nothing is pushed. This is a recorder, not a publisher: it leaves a local branch
+      and prints the exact push / PR commands. Sending work to someone else's project
+      is a human decision, and `verified` is not the same judgment as `mergeable`.
+    """
+    issue, name = item.get("issue_no", "x"), Path(repo).name
+    branch = "fix/%s-%s" % (name, issue)
+    out = {"branch": branch}
+    title = next((l.split("—", 1)[-1].strip() for l in pack.splitlines()
+                  if l.startswith("Issue:")), "fix issue #%s" % issue)
+    url = next((l.split(":", 1)[1].strip() for l in pack.splitlines()
+                if l.startswith("URL:")), "")
+    subject = _subject(title, limit=72 - len("fix: "))
+    msg = "fix: %s\n\nCloses %s\n" % (subject, url) if url else "fix: %s\n" % subject
+    for cmd in (["checkout", "-b", branch], ["add", "-A"], ["commit", "-q", "-m", msg]):
+        r = sh(["git", "-C", wt] + cmd)
+        if r.returncode != 0:
+            out["error"] = "%s failed: %s" % (cmd[0], r.stderr.strip()[:200])
+            return out
+    out["sha"] = sh(["git", "-C", wt, "rev-parse", "HEAD"]).stdout.strip()[:12]
+    fork = sh(["git", "-C", repo, "remote", "get-url", "fork"]).stdout.strip()
+    out["fork"] = fork or None
+    base = item.get("base", "")
+    if fork:
+        slug = fork.split(":")[-1].removesuffix(".git")
+        upstream = sh(["git", "-C", repo, "remote", "get-url", "origin"]).stdout.strip()
+        up = upstream.rstrip("/").removesuffix(".git").split("//")[-1].split("/", 1)[-1]
+        out["push_cmd"] = "git -C %s push fork %s" % (wt, branch)
+        out["pr_url"] = "https://github.com/%s/compare/%s...%s:%s?expand=1" % (
+            up, base, slug.split("/")[0], branch)
+    return out
+
+
 def contract_provenance(contract_path: Path) -> dict:
     """Which rules this batch was judged under.
 
@@ -247,7 +299,19 @@ def run_one(item: dict, args, contract: str, queue_dir: Path, logroot: Path) -> 
     rec["status"] = "captured"
     print(f"  mark-end ok  delta={rec.get('delta')}")
 
-    if args.rm_worktree:
+    # contribution packaging, strictly after the capture boundary has closed
+    if args.branch:
+        rec["promotion"] = promote_to_branch(repo, str(wt), item, pack, rec)
+        p = rec["promotion"]
+        if p.get("error"):
+            print("  ! branch failed:", p["error"])
+        else:
+            print("  branch %s @ %s" % (p["branch"], p.get("sha")))
+            if p.get("push_cmd"):
+                print("    push: %s" % p["push_cmd"])
+                print("    PR:   %s" % p["pr_url"])
+
+    if args.rm_worktree and not (rec.get("promotion") or {}).get("sha"):
         sh(["git", "-C", repo, "worktree", "remove", "--force", str(wt)])
         rec["worktree_removed"] = True
     return rec
@@ -281,6 +345,10 @@ def main():
     ap.add_argument("--bypass-sandbox", action="store_true", default=True,
                     help="run codex with --dangerously-bypass-approvals-and-sandbox (worktrees are disposable)")
     ap.add_argument("--no-bypass-sandbox", dest="bypass_sandbox", action="store_false")
+    ap.add_argument("--branch", action="store_true",
+                    help="after mark-end, commit the work onto fix/<repo>-<issue> and print "
+                         "the push/PR commands. Never pushes: verified is not mergeable, and "
+                         "sending work upstream stays a human decision")
     ap.add_argument("--rm-worktree", action="store_true",
                     help="remove worktree after mark-end (capture is already in the store)")
     ap.add_argument("--dry-run", action="store_true")
