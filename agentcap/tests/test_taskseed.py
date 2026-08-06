@@ -49,7 +49,7 @@ def claude_log(path, cwd, runs):
 
 
 def build_session(tmp, name, source_fix, log_runs, extra_end_files=None,
-                  extra_base_files=None):
+                  extra_base_files=None, commit_at_end=False):
     """A real env session (start/end snapshot) + a fabricated joined trajectory."""
     repo = os.path.join(tmp, name)
     store = os.path.join(tmp, name + "_store")
@@ -71,6 +71,8 @@ def build_session(tmp, name, source_fix, log_runs, extra_end_files=None,
               "from src.mod import f\ndef test_f():\n    assert f() == 0\n")
     for rel, c in (extra_end_files or {}).items():                # e.g. an authored test
         write(repo, rel, c)
+    if commit_at_end:                       # some agents commit their own work
+        git(repo, "add", "-A"); git(repo, "commit", "-qm", "agent commit")
     sess.end_session(session_id=sid, root=store)
 
     log = os.path.join(tmp, name + ".jsonl")
@@ -245,6 +247,33 @@ def main():
                 fails.append("no authored tests -> observed ftp must be kept: %s" % got)
             else:
                 print("[ok] no authored test -> observed flips kept (fallback intact)")
+
+    # --- an agent that commits its work must still be readable ---
+    sdir_c = build_session(tmp, "committed", source_fix=True,
+                           log_runs=[("python -m pytest -q", RED_BROAD),
+                                     ("python -m pytest -q tests/test_mod.py", GREEN_ONE)],
+                           extra_base_files={"tests/test_other.py":
+                                             "def test_legacy_a():\n    assert 1\n"
+                                             "def test_legacy_b():\n    assert 1\n"},
+                           extra_end_files={"tests/test_mod.py":
+                                            "from src.mod import f\n"
+                                            "def test_f():\n    assert f() == 1\n"
+                                            "def test_f_extra():\n    assert f() == 1\n"},
+                           commit_at_end=True)
+    import os as _os
+    diffs = [_os.path.getsize(_os.path.join(sdir_c, "env_end", d))
+             for d in ("staged.diff", "unstaged.diff")]
+    seed_c = T.extract_seed(sdir_c)
+    if any(diffs):
+        fails.append("fixture should have empty diffs after committing: %s" % diffs)
+    elif not seed_c or seed_c["authored_tests"] != ["test_f_extra"]:
+        fails.append("committed work must still yield authored tests: %s"
+                     % (seed_c and seed_c["authored_tests"]))
+    elif seed_c["candidate_fail_to_pass"] != ["tests/test_mod.py::test_f_extra"]:
+        fails.append("committed session ftp not narrowed: %s"
+                     % seed_c["candidate_fail_to_pass"])
+    else:
+        print("[ok] agent committed its work -> authored tests read from the commit range")
 
     # the diff parser itself: only ADDED test defs count
     import tempfile as _tf

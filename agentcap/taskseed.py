@@ -12,6 +12,7 @@ Method (see the method write-up):
 import json
 import os
 import re
+import subprocess
 
 from . import session as sess
 from . import testparse
@@ -123,7 +124,7 @@ def _timeline(runs):
 _ADDED_TEST_RE = re.compile(r"^\+\s*(?:async\s+)?def\s+(test_\w+)", re.M)
 
 
-def _added_test_names(session_dir):
+def _added_test_names(session_dir, session=None):
     """Test functions this session ADDED, read from the end-state diffs.
 
     Observing a node go red then green is not enough to call it the task: a broad
@@ -137,6 +138,14 @@ def _added_test_names(session_dir):
     A test the session wrote is a much stronger statement of intent than a flip
     it merely witnessed. Returns bare function names (node ids are compared on
     their last segment, so this covers pytest, class-scoped and unittest ids).
+
+    The stored diffs go EMPTY when the agent commits its own work — the worktree
+    is then clean against its new HEAD. gpt-5.6-terra does this, gpt-5.6-sol does
+    not, and that difference alone decided whether the narrowing applied
+    (litellm#35796 fell back to eight observed flips and replayed not_green,
+    while the same fix by a non-committing agent verified). So when the diffs
+    yield nothing and the session moved HEAD, read the range instead. Capture must
+    not depend on an agent's git habits.
     """
     names = set()
     for env in ("env_end", "env_start"):
@@ -149,6 +158,19 @@ def _added_test_names(session_dir):
             except OSError:
                 continue
             names |= set(_ADDED_TEST_RE.findall(text))
+    if names or not session:
+        return names
+    start, end = session.get("base_sha_start"), session.get("base_sha_end")
+    if not start or not end or start == end:
+        return names
+    try:
+        repo, _ = sess.resolve_repo(session)
+    except Exception:
+        return names
+    p = subprocess.run(["git", "-C", repo, "diff", "%s..%s" % (start, end)],
+                       capture_output=True)
+    if p.returncode == 0:
+        names |= set(_ADDED_TEST_RE.findall(p.stdout.decode(errors="ignore")))
     return names
 
 
@@ -210,7 +232,7 @@ def extract_seed(session_dir):
     # see _added_test_names. Only narrows when the session added a test that is
     # actually among the observed flips; a session that fixed a pre-existing test
     # without writing one keeps the observed set, which is all it has.
-    added_tests = _added_test_names(session_dir)
+    added_tests = _added_test_names(session_dir, session)
     authored = {n for n in ftp if _node_func(n) in added_tests}
     dropped_observed = sorted(ftp - authored) if authored else []
     if authored:
