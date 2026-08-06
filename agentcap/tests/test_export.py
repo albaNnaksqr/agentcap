@@ -310,6 +310,46 @@ def main():
     else:
         print("[ok] unreadable tracked .env fails closed with a reason")
 
+    # --- codex >=0.144 shapes: actions must survive normalization ---
+    clog2 = os.path.join(tmp, "codex_0144.jsonl")
+    with open(clog2, "w") as f:
+        for d in [
+            {"timestamp": "t0", "payload": {"type": "user_message", "message": PROMPT}},
+            {"timestamp": "t1", "payload": {"type": "reasoning", "summary": [],
+                                            "encrypted_content": "gAAAAABopaque"}},
+            {"timestamp": "t2", "payload": {"type": "agent_message",
+                                            "message": "running the tests"}},
+            {"timestamp": "t3", "payload": {"type": "custom_tool_call", "name": "exec",
+                                            "call_id": "c1",
+                                            "input": "tools.exec_command({cmd:'pytest -q'})"}},
+            {"timestamp": "t4", "payload": {"type": "custom_tool_call_output", "call_id": "c1",
+                                            "output": [{"type": "input_text", "text": RED}]}},
+        ]:
+            f.write(json.dumps(d) + "\n")
+    steps2 = E.normalize_trajectory(clog2, "codex")
+    kinds2 = [s["type"] for s in steps2]
+    if kinds2 != ["user_message", "assistant_message", "tool_call", "tool_result"]:
+        fails.append("codex >=0.144 shapes dropped: %s" % kinds2)
+    elif steps2[2]["name"] != "exec" or "pytest" not in (steps2[2]["input"] or ""):
+        fails.append("custom_tool_call payload lost: %s" % steps2[2])
+    elif RED not in steps2[3]["output"]:
+        fails.append("custom_tool_call_output text lost: %s" % steps2[3])
+    else:
+        print("[ok] codex >=0.144: user/agent messages + custom tool calls normalized")
+
+    # reasoning is counted, never emitted, and flagged unreadable when encrypted
+    rs = E.reasoning_stats(clog2, "codex")
+    if not rs or rs["items"] != 1:
+        fails.append("reasoning items not counted: %s" % rs)
+    elif rs["readable"]:
+        fails.append("encrypted reasoning must not be reported as readable: %s" % rs)
+    elif any(s["type"] == "reasoning" for s in steps2):
+        fails.append("reasoning must not be emitted as a step")
+    elif E.reasoning_stats(clog2, "claude") is not None:
+        fails.append("reasoning_stats should be codex-only")
+    else:
+        print("[ok] reasoning counted but unreadable -> recorded, not emitted")
+
     # --- codex log shape normalizes too ---
     clog = os.path.join(tmp, "codex.jsonl")
     with open(clog, "w") as f:

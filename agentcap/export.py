@@ -90,12 +90,41 @@ def _norm_claude(path):
 
 
 def _norm_codex(path):
+    """codex rollout -> steps. Two log shapes coexist.
+
+    <0.144 uses `message` / `function_call` / `function_call_output`. >=0.144 splits
+    messages into `user_message` / `agent_message` and runs tools through
+    `custom_tool_call` / `custom_tool_call_output`. Recognising only the older set
+    silently drops the entire action sequence: sglang#33504 exported 12 steps with
+    ZERO tool calls while its rollout held 13 custom_tool_call pairs, which made the
+    `reference` trajectory — the chosen side of a future DPO pair — a transcript of
+    talk with no work in it. tooltrace was taught the new shape in July; this
+    normalizer was not.
+
+    `reasoning` items are counted, never emitted: their `summary` is empty and the
+    content is in `encrypted_content`, readable only by the provider. The count is
+    what lets a consumer tell "this agent did not reason" from "its reasoning was
+    never legible to us" — see reasoning_stats().
+    """
     steps = []
     for d in _jsonl(path):
         ts = d.get("timestamp")
         p = d.get("payload") if isinstance(d.get("payload"), dict) else d
         pt = p.get("type")
-        if pt == "message":
+        if pt == "user_message":
+            steps.append({"type": "user_message", "ts": ts,
+                          "text": p.get("message") or ""})
+        elif pt == "agent_message":
+            steps.append({"type": "assistant_message", "ts": ts,
+                          "text": p.get("message") or ""})
+        elif pt == "custom_tool_call":
+            steps.append({"type": "tool_call", "ts": ts,
+                          "name": p.get("name"), "input": p.get("input")})
+        elif pt == "custom_tool_call_output":
+            out = p.get("output")
+            steps.append({"type": "tool_result", "ts": ts,
+                          "output": out if isinstance(out, str) else _text_blocks(out)})
+        elif pt == "message":
             kind = "user_message" if p.get("role") == "user" else "assistant_message"
             steps.append({"type": kind, "ts": ts, "text": _text_blocks(p.get("content"))})
         elif pt == "function_call":
@@ -112,6 +141,29 @@ def _norm_codex(path):
             steps.append({"type": "tool_result", "ts": ts,
                           "output": out if isinstance(out, str) else _text_blocks(out)})
     return steps
+
+
+def reasoning_stats(log_path, agent):
+    """-> {"items": n, "readable": bool} or None when the agent emits no reasoning
+    items at all. A provider that hides chain-of-thought still logs the item with
+    an empty `summary` and an `encrypted_content` blob only it can open, so the
+    absence of reasoning text in a trajectory is a property of the provider, not
+    of the agent's behaviour. Recording the count keeps that distinction in the
+    exported record instead of leaving a consumer to guess."""
+    if agent != "codex":
+        return None
+    items = readable = 0
+    for d in _jsonl(log_path):
+        p = d.get("payload") if isinstance(d.get("payload"), dict) else d
+        if p.get("type") != "reasoning":
+            continue
+        items += 1
+        if _text_blocks(p.get("summary")).strip():
+            readable += 1
+    if not items:
+        return None
+    return {"items": items, "readable_summaries": readable,
+            "readable": readable > 0}
 
 
 def normalize_trajectory(log_path, agent):
@@ -388,6 +440,10 @@ def export_session(session_dir, out, min_tier="medium"):
                     "artifact_source": replay_rep.get("artifact_source"),
                     "interpreter_source": replay_rep.get("interpreter_source")}
                    if replay_rep else None),
+        # reasoning items exist but are provider-encrypted: this says "not legible",
+        # not "not present", so a consumer knows the trajectory is action-level by
+        # necessity rather than by omission
+        "reasoning": reasoning_stats(traj["log_path"], traj.get("agent")),
         "delta": _load(os.path.join(session_dir, "delta.json")),
         "files": {"trajectory": "trajectory.jsonl",
                   "task": "task.json" if task else None, "env": "env/"},
