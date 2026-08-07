@@ -32,7 +32,19 @@ def _cmd_nodes(cmd):
 
 
 # PYTHONPATH=<val> in a test command; val may be quoted or bare (up to whitespace)
-_PP_RE = re.compile(r'PYTHONPATH=("([^"]*)"|\'([^\']*)\'|(\S+))')
+# The unquoted branch must swallow whole `$(...)` / backtick spans: they legally
+# contain spaces (`PYTHONPATH=$(git rev-parse --show-toplevel)/python`), and a bare
+# \S+ would truncate at the first one and yield a plausible-looking but nonexistent
+# component -- worse than not matching, since it silently reintroduces the shadowing.
+_PP_RE = re.compile(
+    r'PYTHONPATH=("([^"]*)"|\'([^\']*)\'|((?:\$\([^)]*\)|`[^`]*`|\S)+))'
+)
+# `$(git rev-parse --show-toplevel)` and its backtick form, tolerant of whitespace.
+# Only this one command is treated as a repo-root alias -- it is the idiom the
+# prepared-runtime notes use; nothing else here executes or guesses at a command.
+_REPO_ROOT_CMD_RE = re.compile(
+    r'\$\(\s*git\s+rev-parse\s+--show-toplevel\s*\)|`\s*git\s+rev-parse\s+--show-toplevel\s*`'
+)
 
 
 def _pythonpath_components(cmd, cwd):
@@ -48,7 +60,12 @@ def _pythonpath_components(cmd, cwd):
     as the literal string, replay then sets a PYTHONPATH that points nowhere, and
     an installed copy of the package silently shadows the reconstructed tree — the
     tests pass or fail against the WRONG code. Observed on sglang#33504/#33505,
-    which replayed as not_green while the same tests were green in the worktree."""
+    which replayed as not_green while the same tests were green in the worktree.
+
+    The same applies when the agent inlines the substitution instead of binding it
+    to a variable first -- `PYTHONPATH="$(git rev-parse --show-toplevel)/python"`.
+    That is not a variable, so an alias table never catches it; it has to be matched
+    as a command. Observed on sglang#33867."""
     m = _PP_RE.search(cmd or "")
     if not m:
         return []
@@ -57,6 +74,8 @@ def _pythonpath_components(cmd, cwd):
     out = []
     for raw in val.split(":"):
         c = raw.strip()
+        # inline `$(git rev-parse --show-toplevel)` / backtick form -> repo root
+        c = _REPO_ROOT_CMD_RE.sub(cwd, c)
         for alias in ("${PWD}", "$PWD", "${REPO_ROOT}", "$REPO_ROOT"):
             c = c.replace(alias, cwd)
         if not c:

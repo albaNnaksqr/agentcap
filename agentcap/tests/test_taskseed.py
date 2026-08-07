@@ -164,6 +164,24 @@ def main():
     pp5 = T._pythonpath_components('PYTHONPATH=${REPO_ROOT} pytest a::b', cwd)
     if pp5 != ["."]:
         fails.append("pythonpath ${REPO_ROOT} -> ['.'], got %s" % pp5)
+    # ...and when the agent inlines the substitution instead of binding a variable.
+    # An alias table cannot catch this: it is a command, not a variable. The bare
+    # and backtick forms matter too -- an \S+ match truncates them at the first
+    # space into a plausible but nonexistent component, which is worse than no
+    # match because it silently restores the shadowing. Observed on sglang#33867.
+    for cmd, want, label in (
+        ('PYTHONPATH="$(git rev-parse --show-toplevel)/python" pytest a::b',
+         ["python"], 'quoted $(git rev-parse ...)'),
+        ('PYTHONPATH=$(git rev-parse --show-toplevel)/python pytest a::b',
+         ["python"], 'bare $(git rev-parse ...)'),
+        ('PYTHONPATH=`git rev-parse --show-toplevel`/python pytest a::b',
+         ["python"], 'backtick git rev-parse'),
+        ('PYTHONPATH="$( git rev-parse  --show-toplevel )/python" pytest a::b',
+         ["python"], 'whitespace-tolerant'),
+    ):
+        got = T._pythonpath_components(cmd, cwd)
+        if got != want:
+            fails.append("pythonpath %s -> %s, got %s" % (label, want, got))
     if any(f.startswith("pythonpath") for f in fails):
         pass
     else:
