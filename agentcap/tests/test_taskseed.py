@@ -302,9 +302,16 @@ def main():
                 "+def test_added():\n+    assert 1\n"
                 "-def test_removed():\n"
                 " def test_untouched():\n"
-                "+    async def test_async_added():\n")
+                "+    async def test_async_added():\n"
+                # a lone `+` blank line followed by a CONTEXT def: the shape an
+                # agent leaves whenever it appends a test above an existing one.
+                # \s in the pattern would cross the newline and claim
+                # test_preexisting as authored, defeating the narrowing entirely.
+                # Seen on litellm#36197.
+                "+    def test_appended(self):\n+        assert 1\n+\n"
+                "     def test_preexisting(self):\n")
     names = T._added_test_names(d)
-    if names != {"test_added", "test_async_added"}:
+    if names != {"test_added", "test_async_added", "test_appended"}:
         fails.append("added-test extraction wrong: %s" % sorted(names))
     elif T._node_func("tests/t.py::Case::test_x[param-1]") != "test_x":
         fails.append("node func extraction wrong: %s"

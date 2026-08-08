@@ -140,7 +140,12 @@ def _timeline(runs):
     return ftp, ptp, evidence
 
 
-_ADDED_TEST_RE = re.compile(r"^\+\s*(?:async\s+)?def\s+(test_\w+)", re.M)
+# Horizontal whitespace only ([^\S\n], not \s). \s crosses newlines, so a lone `+`
+# blank line -- which an agent leaves whenever it appends a test above an existing
+# one -- let the match run past it into the following CONTEXT line and claim a
+# pre-existing test as authored. That silently defeats the narrowing this whole
+# function exists to provide. Seen on litellm#36197.
+_ADDED_TEST_RE = re.compile(r"^\+[^\S\n]*(?:async[^\S\n]+)?def[^\S\n]+(test_\w+)", re.M)
 
 
 def _added_test_names(session_dir, session=None):
