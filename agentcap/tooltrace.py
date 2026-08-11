@@ -19,6 +19,16 @@ from . import testparse
 # codex exec `input` may quote the key or not: {cmd:...} or {"cmd":...}
 _CODEX_CMD_KEY = re.compile(r'["\']?cmd["\']?\s*:\s*')
 
+# A codex exec cell that outlives its `yield_time_ms` does NOT return its output.
+# It returns a placeholder naming the still-running cell, and the agent collects
+# the real output with a later `wait({cell_id})`. Left unstitched, every slow test
+# run looks like a run that produced nothing -- which is not the same as a run that
+# produced no passes, but downstream (value.ended_green, taskseed._timeline) cannot
+# tell the difference and reads it as "not green". Seen on litellm#36487, where a
+# 13s directory run ending `57 passed` was scored ungrounded.
+_CODEX_YIELD_STUB = re.compile(r'Script running with cell ID\s+(\S+)')
+_CODEX_WAIT_CELL = re.compile(r'["\']?cell_id["\']?\s*:\s*["\']?([^"\',}\s]+)')
+
 
 def _text(content):
     """Flatten a tool_result 'content' (str | list of blocks) to text."""
@@ -88,6 +98,7 @@ def claude_runs(path):
 
 def codex_runs(path):
     calls, outputs, order = {}, {}, []
+    waits = {}   # call_id of a `wait` -> the cell id it is collecting
     for line in _lines(path):
         d = _loads(line)
         if not d:
@@ -95,7 +106,19 @@ def codex_runs(path):
         ts = d.get("timestamp")
         p = d.get("payload") if isinstance(d.get("payload"), dict) else d
         pt = p.get("type")
-        if pt == "function_call":
+        if pt in ("function_call", "custom_tool_call") and p.get("name") == "wait":
+            # `wait` arrives as a function_call (args in `arguments`) or a
+            # custom_tool_call (args in `input`) depending on codex version.
+            src = p.get("input") if isinstance(p.get("input"), str) else p.get("arguments")
+            m = _CODEX_WAIT_CELL.search(src or "")
+            if m:
+                waits[p.get("call_id")] = m.group(1)
+            # A wait is not itself a run, but its OUTPUT is the tail of one, so
+            # it still has to occupy a slot in `order`/`outputs`. cmd=None keeps
+            # `_pair` from ever surfacing it as a run of its own.
+            calls[p.get("call_id")] = (None, ts)
+            order.append(p.get("call_id"))
+        elif pt == "function_call":
             args = p.get("arguments")
             if isinstance(args, str):
                 a = _loads(args) or {}
@@ -115,7 +138,35 @@ def codex_runs(path):
         elif pt in ("function_call_output", "custom_tool_call_output"):
             out = p.get("output")
             outputs[p.get("call_id")] = out if isinstance(out, str) else _text(out)
+    _stitch_yielded_cells(outputs, order, waits)
     return _pair(calls, outputs, order)
+
+
+def _stitch_yielded_cells(outputs, order, waits):
+    """Append each `wait`'s output back onto the exec cell it was collecting.
+
+    Matching is by cell id, not by adjacency: the agent may interleave other
+    tool calls between the yield and the wait, and a single cell can yield more
+    than once (each `wait` can itself time out). We therefore walk forward from
+    the stub and take every later wait on that same cell id, in order.
+
+    Appending, never replacing -- a yield can carry partial stdout before the
+    placeholder, and dropping it would trade one lossy read for another."""
+    pending = {}   # cell id -> call_id of the exec that yielded on it
+    for cid in order:
+        out = outputs.get(cid) or ""
+        if cid in waits:
+            owner = pending.get(waits[cid])
+            if owner is not None and out:
+                outputs[owner] = (outputs.get(owner) or "") + "\n" + out
+                # A wait can time out too and hand back another placeholder;
+                # keep the cell pending so the next wait on it also lands.
+                if not _CODEX_YIELD_STUB.search(out):
+                    pending.pop(waits[cid], None)
+            continue
+        m = _CODEX_YIELD_STUB.search(out)
+        if m:
+            pending[m.group(1)] = cid
 
 
 def _pair(calls, outputs, order):
