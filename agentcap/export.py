@@ -10,10 +10,13 @@ Layout, self-contained (reconstructs WITHOUT the original repo):
         env/env_start|end/   manifest + diffs + runtime evidence
         env/blobs/           referenced untracked blobs
 
-The task instance is the RL/DPO product: problem statement (first user message),
-FAIL_TO_PASS/PASS_TO_PASS + observed test commands as the verifier spec, and the
-captured trajectory embedded as `reference` — the chosen side of a future DPO pair;
-`task_key` clusters sessions that solve the same tests. The exit is gated: secret
+The task instance is the RL/DPO product: problem statement (the first user message
+that is not harness preamble), FAIL_TO_PASS/PASS_TO_PASS + observed test commands
+as the verifier spec, and the captured trajectory embedded as `reference` — the
+chosen side of a future DPO pair. `task_key` clusters sessions that solve the same
+tests in the same project, and is None when the seed has no tests; it is keyed on
+the bare repo name so a fork and its upstream cluster together, while `repo` keeps
+the precise `owner/name` for provenance. The exit is gated: secret
 hits quarantine the whole session (trajectory, diffs, untracked blobs, .env names
 are scanned; bundle HISTORY is not — exporting a repo means you own its history).
 """
@@ -30,8 +33,11 @@ from . import tooltrace
 
 _TIER = {"low": 0, "medium": 1, "high": 2}
 
-RECORD_VERSION = 1
-TASK_VERSION = 1
+# v2: `repo` is `owner/name` from the origin remote, not the worktree
+# directory name; task_key is keyed on the bare repo name (so forks cluster)
+# and is None when the seed has no tests.
+RECORD_VERSION = 2
+TASK_VERSION = 2
 
 _SECRETS = [
     ("private_key", re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----')),
@@ -367,15 +373,37 @@ def _problem_statement(steps):
     return None, None
 
 
-def _task_view(session, seed, val, steps, runs, repo_name):
+def _repo_fields(session):
+    """(repo, repo_source, cluster_name) for the record and the task key.
+
+    `repo` is the precise `owner/name` so provenance survives; the KEY uses the
+    bare name so the same project captured through a fork and through upstream
+    lands in one cluster (this store has both spellings of sglang-omni). When no
+    identity was recorded — a pre-`repo_identity` session whose worktree is gone —
+    the old directory name is kept and repo_source says so, rather than guessing
+    an owner."""
+    ident = session.get("repo_identity")
+    dirname = os.path.basename((session.get("repo") or "").rstrip("/")) or "repo"
+    if ident:
+        return ident, "git_remote", ident.split("/")[-1]
+    return dirname, "worktree_dirname", dirname
+
+
+def _task_view(session, seed, val, steps, runs, repo, repo_source, cluster_name):
     tests = seed["candidate_fail_to_pass"] or seed["test_files"]
-    key = hashlib.sha256(("%s|%s" % (repo_name, ",".join(sorted(tests))))
-                         .encode()).hexdigest()[:16]
+    # No tests means nothing to cluster ON. A key built from an empty test list
+    # asserts "these sessions solve the same tests" about sessions that have no
+    # tests at all -- it put 16 unrelated papyrus sessions in one bucket.
+    key = (hashlib.sha256(("%s|%s" % (cluster_name, ",".join(sorted(tests))))
+                          .encode()).hexdigest()[:16] if tests else None)
     statement, stmt_step = _problem_statement(steps)
     return {
         "task_version": TASK_VERSION,
-        "task_key": key,               # sessions solving the same tests cluster here
-        "repo": repo_name,
+        # sessions solving the same tests in the same project cluster here; None
+        # when the seed carries no tests, since there is nothing to cluster on
+        "task_key": key,
+        "repo": repo,
+        "repo_source": repo_source,    # git_remote | worktree_dirname
         "base_commit": session["base_sha_start"],
         "problem_statement": statement,
         # which user message it came from (1-based); >1 means harness preamble
@@ -427,7 +455,7 @@ def export_session(session_dir, out, min_tier="medium"):
         return "quarantined", hits
 
     sid = session["session_id"]
-    repo_name = os.path.basename(session["repo"].rstrip("/")) or "repo"
+    repo, repo_source, cluster_name = _repo_fields(session)
     sdir = os.path.join(out, sid)
     os.makedirs(sdir, exist_ok=True)
     try:
@@ -447,7 +475,7 @@ def export_session(session_dir, out, min_tier="medium"):
     task = None
     if seed:
         runs = tooltrace.test_runs(traj["log_path"], traj.get("agent"))
-        task = _task_view(session, seed, val, steps, runs, repo_name)
+        task = _task_view(session, seed, val, steps, runs, repo, repo_source, cluster_name)
         if replay_rep:
             task["verified"] = bool(replay_rep.get("verified"))
             task["replay_outcome"] = replay_rep.get("outcome")
@@ -461,7 +489,8 @@ def export_session(session_dir, out, min_tier="medium"):
         "record_version": RECORD_VERSION,
         "session_id": sid,
         "agent": session["agent"],
-        "repo": repo_name,
+        "repo": repo,
+        "repo_source": repo_source,
         "created_at": session["created_at"],
         "closed_at": session["closed_at"],
         "start_confidence": session["start_confidence"],

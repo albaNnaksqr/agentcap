@@ -1,6 +1,7 @@
 """Thin git helpers. All content hashing goes through git so we get git-normalized
 blob OIDs (the v0.2 fidelity contract: normalized blob content, not exact disk bytes)."""
 import os
+import re
 import subprocess
 
 
@@ -44,6 +45,29 @@ def object_source(repo):
         cd = os.path.abspath(os.path.join(repo, cd))
     parent = os.path.dirname(cd) if os.path.basename(cd) == ".git" else cd
     return parent if os.path.abspath(parent) != os.path.abspath(repo) else None
+
+
+_REMOTE_RE = re.compile(r"[:/]([^/:]+)/([^/]+?)(?:\.git)?/?$")
+
+
+def repo_identity(repo):
+    """`owner/name` from the origin remote, or None.
+
+    The directory name cannot serve as a repo identity: batch captures run in
+    throwaway worktrees called `<slug>-<issue>-<timestamp>`, so it changes every
+    run. Anything keyed on it is unique by construction — which is how
+    export's task_key came to embed a launch timestamp and could never cluster
+    two runs of the same task.
+
+    The HOST is deliberately dropped. `https://githubfast.com/BerriAI/litellm`
+    and `git@github.com:BerriAI/litellm.git` are the same project through
+    different mirrors/protocols, and a key that tells them apart is wrong."""
+    try:
+        url = out(repo, "remote", "get-url", "origin").strip()
+    except Exception:
+        return None
+    m = _REMOTE_RE.search(url)
+    return "%s/%s" % (m.group(1), m.group(2)) if m else None
 
 
 def tree_sha(repo, rev="HEAD"):

@@ -12,7 +12,7 @@ Run with:  python3 -m agentcap.tests.test_export_statement
 """
 import sys
 
-from agentcap.export import _problem_statement
+from agentcap.export import _problem_statement, _repo_fields
 
 ENV = ('<environment_context>\n  <cwd>/home/u/wt/repo</cwd>\n  <shell>bash</shell>\n'
        '  <current_date>2026-08-13</current_date>\n  <timezone>Asia/Hong_Kong</timezone>\n'
@@ -68,6 +68,48 @@ def main():
         fails.append("harness preamble selected as the problem statement")
     else:
         print("[ok] harness preamble never wins over a later real task")
+
+    # ---- repo identity + task-key clustering -----------------------------
+    # `repo` was the worktree DIRECTORY name, so it carried an issue number and a
+    # launch timestamp -- every batch capture got a unique task_key by
+    # construction and two runs of the same task could never cluster, which is
+    # the one thing task_key exists to do.
+    WT = "/home/u/wt/litellm-35428-20260813-104231"
+    cases = [
+        ("recorded identity wins over the worktree dirname",
+         {"repo": WT, "repo_identity": "BerriAI/litellm"},
+         ("BerriAI/litellm", "git_remote", "litellm")),
+        ("no identity recorded -> dirname kept, source says so",
+         {"repo": WT},
+         ("litellm-35428-20260813-104231", "worktree_dirname",
+          "litellm-35428-20260813-104231")),
+        ("identity None (worktree gone) behaves the same",
+         {"repo": WT, "repo_identity": None},
+         ("litellm-35428-20260813-104231", "worktree_dirname",
+          "litellm-35428-20260813-104231")),
+    ]
+    for label, session, want in cases:
+        got = _repo_fields(session)
+        if got != want:
+            fails.append("%s -> %r (wanted %r)" % (label, got, want))
+        else:
+            print("[ok] %s" % label)
+
+    # two runs of the same task in the same project must land on ONE key, even
+    # from different worktrees; and a fork must join its upstream
+    a = _repo_fields({"repo": "/home/u/wt/litellm-1-111", "repo_identity": "BerriAI/litellm"})
+    b = _repo_fields({"repo": "/home/u/wt/litellm-1-222", "repo_identity": "BerriAI/litellm"})
+    fork = _repo_fields({"repo": "/home/u/wt/omni-1", "repo_identity": "albaNnaksqr/sglang-omni"})
+    up = _repo_fields({"repo": "/home/u/x", "repo_identity": "sgl-project/sglang-omni"})
+    if a[2] != b[2]:
+        fails.append("two worktrees of one project cluster apart: %r vs %r" % (a[2], b[2]))
+    elif fork[2] != up[2]:
+        fails.append("fork does not cluster with upstream: %r vs %r" % (fork[2], up[2]))
+    elif fork[0] == up[0]:
+        fails.append("fork and upstream lost their distinct provenance: %r" % fork[0])
+    else:
+        print("[ok] same project clusters across worktrees; fork joins upstream but "
+              "keeps its own `repo`")
 
     print("-" * 50)
     if fails:

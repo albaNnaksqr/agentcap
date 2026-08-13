@@ -86,6 +86,11 @@ def start_session(repo, agent="manual", confidence="high", root=DEFAULT_ROOT,
         # None for a normal repo; for a throwaway worktree, the repo holding the
         # objects — the only thing that can rebuild this base once it is deleted.
         "repo_object_source": g.object_source(repo),
+        # `owner/name` from the origin remote. Captured HERE and not derived at
+        # export time on purpose: the worktree a batch runs in is deleted, and
+        # after that the only surviving clue is its directory name, which carries
+        # an issue number and a timestamp and is therefore useless as an identity.
+        "repo_identity": g.repo_identity(repo),
         "extra": extra or {},
     }
     _write_json(os.path.join(sdir, "session.json"), session)
