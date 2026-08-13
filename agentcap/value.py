@@ -91,12 +91,25 @@ def assess(session_dir):
         errors |= set(_ERR.findall(r["output"]))
     had_failure = any(p["failed"] or p["counts"].get("failed") or p["counts"].get("error")
                       for p in parsed)
+    # `ended_green` reads the last run that actually SAYS something. A run whose
+    # output carries no counts and no test names is not evidence of red — it is
+    # no evidence at all, and codex truncates a long tail often enough that
+    # scoring such a session `ungrounded` is a measurement artefact, not a
+    # judgement. Seen on litellm#35428: replay proved red_green on 6 tests while
+    # the final recorded run was `original_token_count: 11` worth of progress
+    # dots. How far back we had to look is exposed rather than hidden, because
+    # skipping runs is exactly the kind of leniency that should be auditable.
     ended_green = False
-    if parsed:
-        last = parsed[-1]
-        ended_green = (last["counts"].get("failed", 0) == 0
-                       and last["counts"].get("error", 0) == 0
-                       and (last["counts"].get("passed", 0) > 0 or bool(last["passed"])))
+    ended_green_run = None
+    for i in range(len(parsed) - 1, -1, -1):
+        p = parsed[i]
+        if not (p["counts"] or p["passed"] or p["failed"]):
+            continue                      # silent run: no counts, no names
+        ended_green = (p["counts"].get("failed", 0) == 0
+                       and p["counts"].get("error", 0) == 0
+                       and (p["counts"].get("passed", 0) > 0 or bool(p["passed"])))
+        ended_green_run = i
+        break
 
     # --- axis A: groundedness ---
     if not runs or not ended_green:
@@ -164,6 +177,12 @@ def assess(session_dir):
             "error_types": sorted(errors),
             "observed_failure": had_failure,
             "ended_green": ended_green,
+            # index (in ts order) of the run ended_green was read from, and how
+            # many trailing runs were silent. silent_trailing_runs > 0 means the
+            # verdict rests on an earlier run than the literal last one.
+            "ended_green_run": ended_green_run,
+            "silent_trailing_runs": (0 if ended_green_run is None
+                                     else len(parsed) - 1 - ended_green_run),
         },
         "candidate_fail_to_pass": sorted(ftp),   # a sub-signal now, not the headline
         "note": "heuristic value proxy from deterministic trajectory+env signals; "
