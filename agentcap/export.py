@@ -329,18 +329,51 @@ def _pack_env(session_dir, session, dest):
 
 # --- record + task views ----------------------------------------------------------
 
+# Both harnesses open a session with a preamble delivered AS a user message —
+# plugin recommendations, `<environment_context>` (cwd, shell, date, timezone,
+# permission profile), system reminders. Taking the first user_message therefore
+# picked the preamble, never the task: 45 of 48 instances in export-20260813 had
+# a problem_statement made entirely of it, and the RL/DPO product's prompt is
+# exactly this field, so those instances were unusable as tasks while looking
+# complete. It also dragged absolute host paths into the statement.
+_HARNESS_WRAPPER = re.compile(
+    r"<(recommended_plugins|environment_context|system[-_]reminder)\b[^>]*>.*?</\1>",
+    re.S)
+
+
+def _problem_statement(steps):
+    """The first user message that carries an actual task, and its 1-based index.
+
+    A candidate is judged on what is left after the known harness wrappers are
+    removed, but the ORIGINAL text is returned: that is what the agent was given,
+    and rewriting it would trade a wrong statement for a doctored one. The index
+    is reported so "we skipped some messages" is visible in the artifact rather
+    than implied."""
+    n = 0
+    for s in steps:
+        if s["type"] != "user_message":
+            continue
+        n += 1
+        text = s.get("text") or ""
+        if _HARNESS_WRAPPER.sub("", text).strip():
+            return text, n
+    return None, None
+
+
 def _task_view(session, seed, val, steps, runs, repo_name):
     tests = seed["candidate_fail_to_pass"] or seed["test_files"]
     key = hashlib.sha256(("%s|%s" % (repo_name, ",".join(sorted(tests))))
                          .encode()).hexdigest()[:16]
-    statement = next((s["text"] for s in steps if s["type"] == "user_message"
-                      and s.get("text", "").strip()), None)
+    statement, stmt_step = _problem_statement(steps)
     return {
         "task_version": TASK_VERSION,
         "task_key": key,               # sessions solving the same tests cluster here
         "repo": repo_name,
         "base_commit": session["base_sha_start"],
         "problem_statement": statement,
+        # which user message it came from (1-based); >1 means harness preamble
+        # messages were skipped to find it
+        "problem_statement_step": stmt_step,
         "fail_to_pass": seed["candidate_fail_to_pass"],
         "pass_to_pass": seed["candidate_pass_to_pass"],
         "test_files": seed["test_files"],
