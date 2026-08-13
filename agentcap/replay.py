@@ -67,7 +67,28 @@ def _ensure_python(root):
     return py
 
 
-_PY_RE = re.compile(r"(/[^\s'\"]+/bin/)(?:python[0-9.]*|pytest)\b")
+# Deliberately loose about how the path STARTS: agents write the interpreter as
+# `$HOME/...`, `${HOME}/...` or `~/...` at least as often as as an absolute path,
+# and an anchored `/` here used to make the whole recorded-interpreter fallback a
+# no-op for those sessions — silently, since the report only showed six tests
+# `missing` and no fallback reason. Seen on litellm#35428, where every test run
+# was `"$HOME/workspace/osmind-repos/.venv-litellm/bin/pytest"`.
+# Looseness is safe because _resolve_bindir below still requires the expanded
+# path to be absolute and to exist, and the caller still requires it to import
+# pytest.
+_PY_RE = re.compile(r"([^\s'\"]*/bin/)(?:python[0-9.]*|pytest)\b")
+
+
+def _resolve_bindir(bindir):
+    """Expand a recorded bin/ path, or None if it can't be trusted.
+
+    `$HOME`/`~` are written verbatim into the command, so the literal string
+    never exists on disk. Absolute is required after expansion: a relative
+    `venv/bin/` would otherwise resolve against agentcap's own cwd and could
+    hand back an interpreter with nothing to do with the session. An unset
+    variable stays literal, fails the isabs/exists checks, and drops out."""
+    p = os.path.expanduser(os.path.expandvars(bindir))
+    return p if os.path.isabs(p) else None
 
 
 def _interpreter_from_seed(seed):
@@ -81,7 +102,10 @@ def _interpreter_from_seed(seed):
     """
     counts = {}
     for e in seed.get("evidence") or []:
-        for bindir in _PY_RE.findall(e.get("cmd") or ""):
+        for raw in _PY_RE.findall(e.get("cmd") or ""):
+            bindir = _resolve_bindir(raw)
+            if bindir is None:
+                continue
             for name in ("python3", "python"):
                 cand = os.path.join(bindir, name)
                 if os.path.exists(cand):
