@@ -336,9 +336,16 @@ def _pack_env(session_dir, session, dest):
 # a problem_statement made entirely of it, and the RL/DPO product's prompt is
 # exactly this field, so those instances were unusable as tasks while looking
 # complete. It also dragged absolute host paths into the statement.
+# The list is enumerated from the whole exported population rather than grown one
+# session at a time: after the tag wrappers were handled, all 19 statements still
+# contaminated were the injected project-instructions block, in exactly two
+# spellings ("# AGENTS.md instructions for <path>" x15, "# AGENTS.md
+# instructions" x4). `[^\n]*` not `.*` for the heading — re.S is on for the tag
+# bodies and would otherwise swallow the rest of the message.
 _HARNESS_WRAPPER = re.compile(
-    r"<(recommended_plugins|environment_context|system[-_]reminder)\b[^>]*>.*?</\1>",
-    re.S)
+    r"<(recommended_plugins|environment_context|system[-_]reminder|INSTRUCTIONS)\b[^>]*>.*?</\1>"
+    r"|^\#+[ \t]*(?:AGENTS|CLAUDE)\.md instructions[^\n]*",
+    re.S | re.M)
 
 
 def _problem_statement(steps):

@@ -19,6 +19,9 @@ ENV = ('<environment_context>\n  <cwd>/home/u/wt/repo</cwd>\n  <shell>bash</shel
        '</environment_context>')
 PLUGINS = '<recommended_plugins>\nHere is a list of plugins that are available...\n</recommended_plugins>'
 TASK = '# Task contract — reproduce-then-fix\n\nYou are fixing one GitHub issue.'
+# the injected project-instructions block: the shape that survived the first pass
+AGENTS = ('# AGENTS.md instructions for /home/u/wt/repo\n\n<INSTRUCTIONS>\n'
+          '# Spark Project Runtime Rules\n- do not pip install\n</INSTRUCTIONS>')
 
 
 def um(text):
@@ -31,6 +34,11 @@ def main():
         # (label, steps, expected statement, expected 1-based step)
         ("codex: plugins+env preamble, then contract+pack",
          [um(PLUGINS + "\n" + ENV), um(TASK), um(TASK)], TASK, 2),
+        # the real codex-batch shape: plugins + env + AGENTS.md, all in message 1
+        ("codex: full preamble incl. AGENTS.md block, then the task",
+         [um(PLUGINS + "\n" + ENV + "\n" + AGENTS), um(TASK)], TASK, 2),
+        ("AGENTS.md block with no path in the heading",
+         [um(ENV + "\n" + AGENTS.replace(" for /home/u/wt/repo", "")), um(TASK)], TASK, 2),
         ("claude: env-only preamble, then the ask",
          [um(ENV), um(TASK)], TASK, 2),
         # a real ask in the first message must still be taken as-is, at step 1
