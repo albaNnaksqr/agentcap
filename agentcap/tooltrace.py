@@ -29,6 +29,26 @@ _CODEX_CMD_KEY = re.compile(r'["\']?cmd["\']?\s*:\s*')
 _CODEX_YIELD_STUB = re.compile(r'Script running with cell ID\s+(\S+)')
 _CODEX_WAIT_CELL = re.compile(r'["\']?cell_id["\']?\s*:\s*["\']?([^"\',}\s]+)')
 
+# Newer codex exec returns a script's result as a JSON envelope instead of raw
+# stdout -- either flat, {"chunk_id":..,"exit_code":..,"output":"<escaped>"}, or
+# keyed by cell, {"plan":{},"red":{"chunk_id":..,"output":"<escaped>"}}. The
+# stdout inside is JSON-escaped, so the text we end up with has literal "\n"
+# and no real line breaks.
+#
+# That is worse than it looks. testparse's summary regexes still match ("6 failed
+# in 3.62s"), so the run is not obviously broken -- but every PER-LINE extraction
+# silently returns nothing, and the failing/passing test NAMES are exactly what is
+# extracted per line. No names -> taskseed._timeline sees no red->green flip ->
+# seed writes nothing -> replay reports no_runnable_tests -> `verified` can never
+# be earned, for a session that demonstrably went red then green.
+# Seen on litellm#35428, whose RED run (`6 failed`) and full-suite run both came
+# back enveloped while the small green run came back as raw text.
+#
+# `chunk_id` is the envelope's fingerprint: we only unwrap `output` values that
+# sit in a dict carrying it, so a test that legitimately prints JSON with an
+# "output" key is left alone.
+_CODEX_ENVELOPE_HINT = "chunk_id"
+
 
 def _text(content):
     """Flatten a tool_result 'content' (str | list of blocks) to text."""
@@ -137,9 +157,75 @@ def codex_runs(path):
             order.append(cid)
         elif pt in ("function_call_output", "custom_tool_call_output"):
             out = p.get("output")
-            outputs[p.get("call_id")] = out if isinstance(out, str) else _text(out)
+            txt = out if isinstance(out, str) else _text(out)
+            outputs[p.get("call_id")] = _unwrap_codex_envelopes(txt)
     _stitch_yielded_cells(outputs, order, waits)
     return _pair(calls, outputs, order)
+
+
+def _unwrap_codex_envelopes(text):
+    """Replace each codex JSON result envelope in `text` with the stdout it carries.
+
+    Text around the envelope is kept -- the preamble ("Script completed / Wall
+    time ... / Output:", and codex's own "Warning: truncated output (original
+    token count: N)") is real information, and the truncation warning is the only
+    signal that what follows is incomplete. So this rewrites the envelope's span
+    in place rather than returning the payload alone.
+
+    A dict qualifies only if it carries `chunk_id`; `output` values are collected
+    from any depth in traversal order, so both the flat and the keyed-by-cell
+    shapes work, and a multi-cell script's cells stay in the order they ran."""
+    if not text or _CODEX_ENVELOPE_HINT not in text:
+        return text
+    dec = json.JSONDecoder()
+    parts, i = [], 0
+    while True:
+        j = text.find("{", i)
+        if j == -1:
+            break
+        try:
+            obj, end = dec.raw_decode(text, j)
+        except ValueError:
+            # not the start of a JSON value -- step past this brace, don't give up:
+            # a later brace in the same blob may still be the envelope.
+            parts.append(text[i:j + 1])
+            i = j + 1
+            continue
+        payload = _collect_envelope_output(obj)
+        if payload is None:
+            parts.append(text[i:end])       # real JSON, but not ours: leave verbatim
+        else:
+            parts.append(text[i:j])
+            parts.append(payload)
+        i = end
+    parts.append(text[i:])
+    return "".join(parts)
+
+
+def _collect_envelope_output(obj):
+    """stdout carried by a codex envelope, or None if `obj` isn't one.
+
+    Returns "" for an envelope whose output is empty (a cell that ran and printed
+    nothing) -- distinct from None, so an empty cell still consumes its span
+    instead of leaving the raw JSON in the text."""
+    found = []
+
+    def walk(o):
+        if isinstance(o, dict):
+            is_env = _CODEX_ENVELOPE_HINT in o
+            for k, v in o.items():
+                if is_env and k == "output" and isinstance(v, str):
+                    found.append(v)
+                else:
+                    walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    walk(obj)
+    if not found:
+        return None
+    return "\n".join(found)
 
 
 def _stitch_yielded_cells(outputs, order, waits):
