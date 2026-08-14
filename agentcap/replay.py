@@ -34,8 +34,49 @@ from . import testparse
 from .export import _bundle, _tree_snapshot
 from .verify import reconstruct
 
-REPLAY_VERSION = 1
+REPLAY_VERSION = 2
 DEFAULT_TIMEOUT = 300
+
+
+def _regression_scope(test_files):
+    """Repo-relative directory to sweep for the regression set, or None.
+
+    The nearest common ancestor of the session's test files. For litellm#35428
+    that resolves to `tests/test_litellm/llms/azure` — the same 336-test scope a
+    human would check by hand — because the two touched test files sit in sibling
+    directories under it.
+
+    Refuses to go shallower than two path segments: `tests/` alone means "run the
+    entire suite", which on a repo whose full suite does not even collect turns a
+    regression check into a guaranteed timeout. Returning None is honest; a bogus
+    scope is not. The chosen scope is always recorded in the report."""
+    dirs = sorted({os.path.dirname(p) for p in (test_files or []) if os.path.dirname(p)})
+    if not dirs:
+        return None
+    common = dirs[0] if len(dirs) == 1 else os.path.commonpath(dirs)
+    if not common or common in (".", "/") or len(common.strip("/").split("/")) < 2:
+        return None
+    return common
+
+
+def _sweep(python, tree, scope, timeout, pythonpath=None):
+    """Node ids that PASS under `scope` -> (passed:set, completed:bool).
+
+    Runs with `-v` on purpose. This set can never be mined from the session log:
+    agents run `pytest -q`, which prints progress dots and no node ids, so
+    taskseed's pass_to_pass was empty for all 50 seeds in the store — not because
+    those sessions had no passing tests, but because their names were never
+    written down anywhere. Replay has the reconstructed tree, so it can produce
+    the names instead of hunting for them."""
+    pp = os.pathsep.join(pythonpath) if pythonpath else "."
+    env = dict(os.environ, PYTHONPATH=pp, PYTHONDONTWRITEBYTECODE="1")
+    try:
+        p = subprocess.run([python, "-m", "pytest", "-v", "--tb=no", "--no-header", scope],
+                           cwd=tree, env=env, capture_output=True, text=True,
+                           timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return set(), False
+    return testparse.parse(p.stdout + p.stderr, "pytest")["passed"], True
 
 
 def _grade(tests):
@@ -252,7 +293,7 @@ def _materialize(workdir, name, source, capture_dir, cas_root, base_sha=None):
 
 
 def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None,
-                   allow_local_repo=False):
+                   allow_local_repo=False, regression_timeout=None):
     """Rebuild the exportable artifact in a temp dir and grade it. Writes
     <session_dir>/replay.json; returns the report (None when no seed)."""
     seed_p = os.path.join(session_dir, "task_seed.json")
@@ -269,6 +310,11 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None,
         "artifact_source": None, "portability": None,
         "artifact_fallback_reason": None, "interpreter_source": None,
         "interpreter_fallback_reason": None,
+        # regression half of the verifier spec: tests that pass at BOTH ends
+        # (pass_to_pass) and tests the session broke (regressions). None scope
+        # means it could not be determined -- see _regression_scope.
+        "regression_scope": None, "pass_to_pass": [], "regressions": [],
+        "improved": [], "regression_reason": None,
         "durations": {}, "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
     workdir = tempfile.mkdtemp(prefix="agentcap-replay-")
@@ -281,6 +327,7 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None,
         report["interpreter_source"] = "explicit" if fixed_python else "ambient"
         report["python"] = python
 
+        start_tree = None
         source, kind, fb_reason = _artifact_source(session, workdir, allow_local_repo)
         report["artifact_source"] = kind
         report["portability"] = ("machine_local" if kind == "local_repo"
@@ -324,7 +371,7 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None,
         if runnable and all(t["end_status"] == "passed" for t in runnable):
             # RED: START state + the end's test files overlaid (the test patch)
             t0 = time.time()
-            start_tree = _materialize(workdir, "start", source,
+            start_tree = start_tree or _materialize(workdir, "start", source,
                                       os.path.join(session_dir, "env_start"),
                                       session["cas_root"], session["base_sha_start"])
             for rel in seed["test_files"]:
@@ -343,6 +390,43 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None,
                 return report
         report["tests"] = tests
         report["outcome"], report["verified"], report["reason"] = _grade(tests)
+
+        # Regression half. Only worth the two directory runs once the fail_to_pass
+        # gate has already passed: a session that is not red->green will not be
+        # verified whatever the sweep says.
+        if report["verified"] and start_tree:
+            scope = _regression_scope(seed.get("test_files"))
+            report["regression_scope"] = scope
+            if scope is None:
+                report["regression_reason"] = "scope_undeterminable"
+            else:
+                t0 = time.time()
+                rt = regression_timeout or max(timeout * 10, 600)
+                end_pass, ok_e = _sweep(python, end_tree, scope, rt, pp)
+                start_pass, ok_s = _sweep(python, start_tree, scope, rt, pp)
+                report["durations"]["regression_s"] = round(time.time() - t0, 1)
+                if not (ok_e and ok_s):
+                    report["regression_reason"] = "sweep_timeout"
+                else:
+                    ftp_set = set(ftp)
+                    # pass at both ends -> a regression witness a future candidate
+                    # patch must keep green
+                    report["pass_to_pass"] = sorted((end_pass & start_pass) - ftp_set)
+                    # passed at START, not at END -> this session broke it. Also
+                    # catches a deleted or renamed pre-existing test, which the
+                    # task contract forbids outright.
+                    report["regressions"] = sorted((start_pass - end_pass) - ftp_set)
+                    # red->green flips the SEED did not claim as fail_to_pass --
+                    # the dropped_observed_ftp population (23 across the store),
+                    # normally the authored-test narrowing doing its job. Recorded
+                    # so that narrowing stays auditable instead of vanishing: an
+                    # unexpectedly large `improved` set means the session fixed
+                    # more than the task says it did.
+                    report["improved"] = sorted((end_pass - start_pass) - ftp_set)
+                    if report["regressions"]:
+                        report["outcome"] = "red_green_with_regression"
+                        report["verified"] = False
+                        report["reason"] = "regressions"
         return report
     except Exception as e:
         report["error"] = "%s: %s" % (type(e).__name__, e)
