@@ -31,12 +31,31 @@ def main():
         "$VAR": '"$HOME/wt/.venv/bin/pytest" -q',
         "${VAR}": '"${HOME}/wt/.venv/bin/python3" -m pytest',
         "~": '~/wt/.venv/bin/python -m pytest',
+        # the sglang recipe: path present as an ASSIGNMENT, invoked via the var.
+        # A greedy pattern captures the `SGLANG_PY=` prefix, fails isabs, and
+        # silently loses the session -- this regressed sglang#33504/#33505.
+        "VAR= assignment": ('SGLANG_PY=/home/k/envs/sglang/bin/python; '
+                            'PYTHONPATH=x "$SGLANG_PY" -m pytest t.py'),
     }
     for label, cmd in cases.items():
-        if not R._PY_RE.findall(cmd):
+        got = R._PY_RE.findall(cmd)
+        if not got:
             fails.append("_PY_RE misses the %s spelling: %r" % (label, cmd))
+        elif any(R._resolve_bindir(b) is None for b in got):
+            # matching is not enough: a capture that swallows a `VAR=` prefix
+            # matches and is then thrown away by isabs, which looks identical to
+            # "no interpreter recorded"
+            fails.append("_PY_RE captured an unusable path for %s: %r" % (label, got))
     if not fails:
-        print("[ok] _PY_RE matches absolute, $VAR, ${VAR} and ~ spellings")
+        print("[ok] _PY_RE matches /abs, $VAR, ${VAR}, ~ and VAR= spellings, "
+              "and every capture resolves")
+
+    # a relative path must not match at all -- it would resolve against
+    # agentcap's own cwd
+    if R._PY_RE.findall("venv/bin/python -m pytest"):
+        fails.append("_PY_RE matched a relative interpreter path")
+    else:
+        print("[ok] a relative venv/bin/python is not matched")
 
     # 2. expansion + the guards that make the loose regex safe
     if R._resolve_bindir("$HOME/x/bin/") != os.path.expanduser("~/x/bin/"):

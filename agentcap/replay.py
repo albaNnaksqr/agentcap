@@ -108,16 +108,21 @@ def _ensure_python(root):
     return py
 
 
-# Deliberately loose about how the path STARTS: agents write the interpreter as
-# `$HOME/...`, `${HOME}/...` or `~/...` at least as often as as an absolute path,
-# and an anchored `/` here used to make the whole recorded-interpreter fallback a
-# no-op for those sessions — silently, since the report only showed six tests
-# `missing` and no fallback reason. Seen on litellm#35428, where every test run
-# was `"$HOME/workspace/osmind-repos/.venv-litellm/bin/pytest"`.
-# Looseness is safe because _resolve_bindir below still requires the expanded
-# path to be absolute and to exist, and the caller still requires it to import
-# pytest.
-_PY_RE = re.compile(r"([^\s'\"]*/bin/)(?:python[0-9.]*|pytest)\b")
+# The path may START four ways, all seen in real captures, and the pattern has to
+# accept exactly those and nothing else:
+#   /abs/.../bin/pytest                                     litellm, sglang
+#   "$HOME/.../bin/pytest"  "${HOME}/.../bin/python3"        litellm#35428
+#   ~/.../bin/python
+# Two failures to avoid, one in each direction:
+#   anchoring at `/` made the whole recorded-interpreter fallback a silent no-op
+#   for the $HOME spelling (it matched the tail `/wt/.venv/bin/`, which does not
+#   exist) — the report just showed tests `missing` with no fallback reason.
+#   Dropping the anchor entirely was worse: `[^\s'\"]*` is greedy from the start
+#   of the token, so `SGLANG_PY=/home/.../bin/python` captured the `SGLANG_PY=`
+#   prefix, failed isabs, and lost sglang#33504/#33505 — which HAD been verified.
+# Hence an explicit set of openers plus a non-greedy body.
+_PY_RE = re.compile(
+    r"((?:/|~/|\$\{?[A-Za-z_]\w*\}?/)[^\s'\"]*?/bin/)(?:python[0-9.]*|pytest)\b")
 
 
 def _resolve_bindir(bindir):
@@ -407,6 +412,13 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None,
                 report["durations"]["regression_s"] = round(time.time() - t0, 1)
                 if not (ok_e and ok_s):
                     report["regression_reason"] = "sweep_timeout"
+                elif not end_pass:
+                    # Swept fine and collected nothing -- a repo with no pytest
+                    # (slime runs a hand-rolled `PASS <file>` harness), or a scope
+                    # that does not collect. An empty pass_to_pass with no reason
+                    # reads as a clean bill of health, which is the opposite of
+                    # the truth, so say why it is empty.
+                    report["regression_reason"] = "no_tests_collected"
                 else:
                     ftp_set = set(ftp)
                     # pass at both ends -> a regression witness a future candidate
