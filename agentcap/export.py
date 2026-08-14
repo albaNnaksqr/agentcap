@@ -33,11 +33,15 @@ from . import tooltrace
 
 _TIER = {"low": 0, "medium": 1, "high": 2}
 
-# v2: `repo` is `owner/name` from the origin remote, not the worktree
-# directory name; task_key is keyed on the bare repo name (so forks cluster)
-# and is None when the seed has no tests.
-RECORD_VERSION = 2
-TASK_VERSION = 2
+# v2: `repo` is `owner/name` from the origin remote, not the worktree directory
+#     name; task_key is keyed on the bare repo name (so forks cluster) and is
+#     None when the seed has no tests.
+# v3: pass_to_pass comes from replay's sweep instead of the session log, where it
+#     was empty by construction, so the field's meaning changed for consumers.
+#     Adds pass_to_pass_source / regression_scope / regression_reason /
+#     regressions to the task, and the matching counts to the record.
+RECORD_VERSION = 3
+TASK_VERSION = 3
 
 _SECRETS = [
     ("private_key", re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----')),
@@ -389,6 +393,35 @@ def _repo_fields(session):
     return dirname, "worktree_dirname", dirname
 
 
+def _apply_regression_spec(task, replay_rep):
+    """Take the regression half of the verifier spec from replay, not from the seed.
+
+    taskseed derives pass_to_pass from named PASSED node ids in the session log,
+    and agents run `pytest -q`, which prints dots and no names — so the seed's set
+    was empty for all 50 seeds in the store, and every exported instance shipped a
+    verifier spec with no regression guard. replay runs the sweep itself against
+    the reconstructed trees, so its set is the real one.
+
+    `pass_to_pass_source` and `regression_reason` are what keep an empty guard
+    honest: 5 of the 18 verified sessions collect no tests at all (a repo with no
+    pytest, or a scope that does not collect), and an unexplained empty list reads
+    as a clean bill of health rather than as "nothing was measured"."""
+    scope = replay_rep.get("regression_scope")
+    reason = replay_rep.get("regression_reason")
+    ptp = replay_rep.get("pass_to_pass")
+    if scope and not reason and ptp:
+        task["pass_to_pass"] = ptp
+        task["pass_to_pass_source"] = "replay_sweep"
+    else:
+        # keep whatever the seed had (in practice []), and say why
+        task["pass_to_pass_source"] = "session_log"
+    task["regression_scope"] = scope
+    task["regression_reason"] = reason
+    # non-empty means `verified` is already False; shipped so a consumer can see
+    # WHY without going back to the record
+    task["regressions"] = replay_rep.get("regressions") or []
+
+
 def _task_view(session, seed, val, steps, runs, repo, repo_source, cluster_name):
     tests = seed["candidate_fail_to_pass"] or seed["test_files"]
     # No tests means nothing to cluster ON. A key built from an empty test list
@@ -482,6 +515,7 @@ def export_session(session_dir, out, min_tier="medium"):
             # a consumer that needs to rebuild the artifact elsewhere must be able
             # to tell an earned-but-machine-local verdict from a portable one
             task["replay_portability"] = replay_rep.get("portability")
+            _apply_regression_spec(task, replay_rep)
         _write(os.path.join(sdir, "task.json"), task)
 
     verify_rep = _load(os.path.join(session_dir, "verify.json")) or {}
@@ -507,7 +541,15 @@ def export_session(session_dir, out, min_tier="medium"):
                     "verified": replay_rep.get("verified"),
                     "portability": replay_rep.get("portability"),
                     "artifact_source": replay_rep.get("artifact_source"),
-                    "interpreter_source": replay_rep.get("interpreter_source")}
+                    "interpreter_source": replay_rep.get("interpreter_source"),
+                    # counts here, full lists in task.json: the record is the
+                    # summary doc, the task is the spec. regression_reason is
+                    # what stops n_pass_to_pass == 0 from reading as "clean".
+                    "regression_scope": replay_rep.get("regression_scope"),
+                    "regression_reason": replay_rep.get("regression_reason"),
+                    "n_pass_to_pass": len(replay_rep.get("pass_to_pass") or []),
+                    "n_regressions": len(replay_rep.get("regressions") or []),
+                    "n_improved": len(replay_rep.get("improved") or [])}
                    if replay_rep else None),
         # reasoning items exist but are provider-encrypted: this says "not legible",
         # not "not present", so a consumer knows the trajectory is action-level by

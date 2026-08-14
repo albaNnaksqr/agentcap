@@ -15,6 +15,7 @@ import sys
 import tempfile
 
 from agentcap import replay as R
+from agentcap.export import _apply_regression_spec
 
 
 def write(tree, rel, body):
@@ -100,6 +101,38 @@ def main():
                 print("[ok] a sweep timeout reports completed=False, not an empty set")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- export takes the set from replay, and labels an empty one -------
+    cases = [
+        ("swept and found witnesses -> replay's set wins",
+         {"regression_scope": "tests/x", "regression_reason": None,
+          "pass_to_pass": ["tests/x::a", "tests/x::b"], "regressions": []},
+         {"pass_to_pass": ["tests/x::a", "tests/x::b"],
+          "pass_to_pass_source": "replay_sweep", "regressions": []}),
+        # an empty guard must say WHY, or it reads as a clean bill of health
+        ("collected nothing -> seed's set kept, reason carried",
+         {"regression_scope": "tests/x", "regression_reason": "no_tests_collected",
+          "pass_to_pass": [], "regressions": []},
+         {"pass_to_pass": ["seed_ptp"], "pass_to_pass_source": "session_log",
+          "regression_reason": "no_tests_collected"}),
+        ("no scope -> seed's set kept, reason carried",
+         {"regression_scope": None, "regression_reason": "scope_undeterminable",
+          "pass_to_pass": [], "regressions": []},
+         {"pass_to_pass": ["seed_ptp"], "pass_to_pass_source": "session_log",
+          "regression_scope": None}),
+        ("regressions are shipped so a consumer sees WHY verified is false",
+         {"regression_scope": "tests/x", "regression_reason": None,
+          "pass_to_pass": ["tests/x::a"], "regressions": ["tests/x::broke"]},
+         {"regressions": ["tests/x::broke"], "pass_to_pass_source": "replay_sweep"}),
+    ]
+    for label, rep, want in cases:
+        task = {"pass_to_pass": ["seed_ptp"]}
+        _apply_regression_spec(task, rep)
+        bad = {k: (task.get(k), v) for k, v in want.items() if task.get(k) != v}
+        if bad:
+            fails.append("export spec: %s -> %r" % (label, bad))
+        else:
+            print("[ok] export spec: %s" % label)
 
     print("-" * 50)
     if fails:
