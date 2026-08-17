@@ -439,7 +439,11 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None,
         # gate has already passed: a session that is not red->green will not be
         # verified whatever the sweep says.
         if report["verified"] and start_tree:
-            scope = _regression_scope(seed.get("test_files"))
+            # When the common ancestor is unusable (too shallow, or the files sit
+            # in unrelated trees) the FILES are still a valid target. A narrow
+            # witness set beats none, and the recorded scope shows which it is.
+            scope = _regression_scope(seed.get("test_files")) \
+                or _regression_scope_fallback(seed, None)
             report["regression_scope"] = scope
             if scope is None:
                 report["regression_reason"] = "scope_undeterminable"
@@ -472,6 +476,8 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None,
                         report["pass_to_pass"] = sorted((end_pass & start_pass) - ftp_set)
                         report["regressions"] = sorted((start_pass - end_pass) - ftp_set)
                         report["improved"] = sorted((end_pass - start_pass) - ftp_set)
+                        if not report["pass_to_pass"]:
+                            report["regression_reason"] = "no_witnesses_outside_ftp"
                         if report["regressions"]:
                             report["outcome"] = "red_green_with_regression"
                             report["verified"] = False
@@ -499,6 +505,12 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None,
                     # unexpectedly large `improved` set means the session fixed
                     # more than the task says it did.
                     report["improved"] = sorted((end_pass - start_pass) - ftp_set)
+                    # A sweep that ran fine but yielded no shared witness must say
+                    # so too: the scope can hold nothing but the fail_to_pass test
+                    # itself (slime#2165's file has exactly one test). ptp=0 with
+                    # no reason is the clean-bill-of-health trap all over again.
+                    if not report["pass_to_pass"]:
+                        report["regression_reason"] = "no_witnesses_outside_ftp"
                     if report["regressions"]:
                         report["outcome"] = "red_green_with_regression"
                         report["verified"] = False

@@ -125,6 +125,17 @@ def main():
         else:
             print("[ok] fallback scope: %s" % label)
 
+    # a too-shallow ancestor is not the end of it: the files themselves are a
+    # valid target, and this is how the two scope_undeterminable sessions
+    # (test_files = ['tests/test_swa_verifier.py'], dirname 'tests') get a guard
+    shallow = {"test_files": ["tests/test_swa_verifier.py"]}
+    if R._regression_scope(shallow["test_files"]) is not None:
+        fails.append("a 1-segment ancestor should still be refused as a directory scope")
+    elif R._regression_scope_fallback(shallow, None) != "tests/test_swa_verifier.py":
+        fails.append("no file-level target for a too-shallow ancestor")
+    else:
+        print("[ok] too-shallow ancestor still yields a file-level target")
+
     # ---- grading: a guard is not counter-evidence -------------------------
     # The task contract asks for a guard covering neighbouring behaviour, and a
     # guard passes before the fix BY DEFINITION. Demanding every candidate be red
@@ -151,6 +162,19 @@ def main():
             fails.append("grade: %s -> %r (wanted %r)" % (label, (outcome, verified), want))
         else:
             print("[ok] grade: %s" % label)
+
+    # every empty guard must carry a reason -- this was the last unlabelled one
+    for lbl, rep, want in [
+        ("swept fine but the scope held only the ftp test",
+         {"regression_scope": "tests/t.py", "regression_reason": "no_witnesses_outside_ftp",
+          "pass_to_pass": [], "regressions": []}, "session_log"),
+    ]:
+        task = {"pass_to_pass": []}
+        _apply_regression_spec(task, rep)
+        if task.get("pass_to_pass_source") != want or not task.get("regression_reason"):
+            fails.append("empty guard without a reason survived: %s -> %r" % (lbl, task))
+        else:
+            print("[ok] export spec: %s carries its reason" % lbl)
 
     # ---- export takes the set from replay, and labels an empty one -------
     cases = [
