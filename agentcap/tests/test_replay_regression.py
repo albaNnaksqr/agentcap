@@ -15,6 +15,7 @@ import sys
 import tempfile
 
 from agentcap import replay as R
+from agentcap.replay import _grade
 from agentcap.export import _apply_regression_spec
 
 
@@ -101,6 +102,33 @@ def main():
                 print("[ok] a sweep timeout reports completed=False, not an empty set")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- grading: a guard is not counter-evidence -------------------------
+    # The task contract asks for a guard covering neighbouring behaviour, and a
+    # guard passes before the fix BY DEFINITION. Demanding every candidate be red
+    # at START punished exactly that (litellm#37105 was graded green_only for
+    # writing the guard its pack asked for).
+    def t(end, start, name="x"):
+        return {"node_id": "tests/t.py::%s" % name, "end_status": end, "start_status": start}
+    grade_cases = [
+        ("one real red->green + one guard -> red_green",
+         [t("passed", "failed", "fix"), t("passed", "passed", "guard")], ("red_green", True)),
+        ("all candidates green at START -> still green_only (the vacuous case)",
+         [t("passed", "passed", "a"), t("passed", "passed", "b")], ("green_only", False)),
+        ("classic all-red -> red_green", [t("passed", "failed")], ("red_green", True)),
+        ("any END not green -> not_green", [t("failed", "failed")], ("not_green", False)),
+        # missing/error at START keep counting as "not passed", unchanged
+        ("missing at START still counts as red",
+         [t("passed", "missing")], ("red_green", True)),
+        ("nothing runnable at END -> setup_failed",
+         [t("missing", None)], ("setup_failed", False)),
+    ]
+    for label, tests, want in grade_cases:
+        outcome, verified, _ = _grade(tests)
+        if (outcome, verified) != want:
+            fails.append("grade: %s -> %r (wanted %r)" % (label, (outcome, verified), want))
+        else:
+            print("[ok] grade: %s" % label)
 
     # ---- export takes the set from replay, and labels an empty one -------
     cases = [

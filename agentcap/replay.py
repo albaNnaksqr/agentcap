@@ -81,13 +81,30 @@ def _sweep(python, tree, scope, timeout, pythonpath=None):
 
 def _grade(tests):
     """-> (outcome, verified, reason). Gate over ids runnable at END;
-    missing-at-end ids (renamed mid-session) are recorded but excluded."""
+    missing-at-end ids (renamed mid-session) are recorded but excluded.
+
+    A candidate that passes at BOTH ends is a guard, not counter-evidence. The
+    task contract asks agents to write guards — an assertion covering neighbouring
+    behaviour that must keep working — and a guard passes before the fix by
+    definition. taskseed cannot tell one from a real fail_to_pass, because during
+    development the guard usually does flip red->green once (an incomplete fixture),
+    and the authored-test narrowing then keeps it.
+
+    Requiring EVERY candidate to be red at START therefore punished exactly the
+    behaviour the contract demands: litellm#37105 wrote one genuine red->green test
+    plus the guard the pack asked for, and was graded green_only for writing the
+    guard. So the quantifier is existential now — at least one candidate red at
+    START — while the "not passed" notion is unchanged, so missing/error at START
+    keep counting as they did.
+
+    Still refused: every candidate green at START. That is the vacuous case the
+    gate exists for, and it stays green_only."""
     runnable = [t for t in tests if t["end_status"] != "missing"]
     if not runnable:
         return "setup_failed", False, "no_runnable_tests"
     if any(t["end_status"] != "passed" for t in runnable):
         return "not_green", False, None
-    if any(t["start_status"] == "passed" for t in runnable):
+    if not any(t["start_status"] != "passed" for t in runnable):
         return "green_only", False, None
     return "red_green", True, None
 
@@ -320,6 +337,10 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None,
         # means it could not be determined -- see _regression_scope.
         "regression_scope": None, "pass_to_pass": [], "regressions": [],
         "improved": [], "regression_reason": None,
+        # candidates that passed at BOTH ends: guards the seed could not tell
+        # apart from real fail_to_pass. They are folded into pass_to_pass, which
+        # is what they actually are.
+        "guards_in_ftp": [],
         "durations": {}, "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
     workdir = tempfile.mkdtemp(prefix="agentcap-replay-")
@@ -395,6 +416,9 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None,
                 return report
         report["tests"] = tests
         report["outcome"], report["verified"], report["reason"] = _grade(tests)
+        report["guards_in_ftp"] = sorted(t["node_id"] for t in tests
+                                         if t["end_status"] == "passed"
+                                         and t["start_status"] == "passed")
 
         # Regression half. Only worth the two directory runs once the fail_to_pass
         # gate has already passed: a session that is not red->green will not be
@@ -439,6 +463,14 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None,
                         report["outcome"] = "red_green_with_regression"
                         report["verified"] = False
                         report["reason"] = "regressions"
+
+        # A guard passes at both ends, which IS the definition of a pass_to_pass
+        # witness. Folded in outside the sweep block on purpose: it holds even
+        # when the sweep could not run, so a session whose scope collects nothing
+        # still ships the one witness replay proved directly.
+        if report["guards_in_ftp"]:
+            report["pass_to_pass"] = sorted(set(report["pass_to_pass"])
+                                            | set(report["guards_in_ftp"]))
         return report
     except Exception as e:
         report["error"] = "%s: %s" % (type(e).__name__, e)
