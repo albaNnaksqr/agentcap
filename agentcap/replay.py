@@ -59,6 +59,20 @@ def _regression_scope(test_files):
     return common
 
 
+def _regression_scope_fallback(seed, tried):
+    """The test files themselves, as a space-joined pytest target, or None.
+
+    Used only when the common-ancestor scope collected nothing. Narrower than a
+    directory sweep — it cannot see a sibling file the change broke, which is the
+    case the directory scope exists for — so it is a second choice, never the
+    first, and the report records which scope actually produced the numbers."""
+    files = [f for f in (seed.get("test_files") or []) if f]
+    if not files:
+        return None
+    joined = " ".join(sorted(files))
+    return joined if joined != tried else None
+
+
 def _sweep(python, tree, scope, timeout, pythonpath=None):
     """Node ids that PASS under `scope` -> (passed:set, completed:bool).
 
@@ -71,7 +85,8 @@ def _sweep(python, tree, scope, timeout, pythonpath=None):
     pp = os.pathsep.join(pythonpath) if pythonpath else "."
     env = dict(os.environ, PYTHONPATH=pp, PYTHONDONTWRITEBYTECODE="1")
     try:
-        p = subprocess.run([python, "-m", "pytest", "-v", "--tb=no", "--no-header", scope],
+        p = subprocess.run([python, "-m", "pytest", "-v", "--tb=no", "--no-header",
+                            *scope.split()],
                            cwd=tree, env=env, capture_output=True, text=True,
                            timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -436,6 +451,31 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None,
                 report["durations"]["regression_s"] = round(time.time() - t0, 1)
                 if not (ok_e and ok_s):
                     report["regression_reason"] = "sweep_timeout"
+                elif not end_pass and _regression_scope_fallback(seed, scope):
+                    # The common ancestor can be a huge directory that does not
+                    # collect (a single test file sitting directly under
+                    # tests/test_litellm gives exactly that, and litellm#36999
+                    # lost its whole guard to it). Retry on the test files
+                    # themselves before giving up -- narrower, but a real witness
+                    # set beats an empty one.
+                    scope = _regression_scope_fallback(seed, scope)
+                    report["regression_scope"] = scope
+                    end_pass, ok_e = _sweep(python, end_tree, scope, rt, pp)
+                    start_pass, ok_s = _sweep(python, start_tree, scope, rt, pp)
+                    report["durations"]["regression_s"] = round(time.time() - t0, 1)
+                    if not (ok_e and ok_s):
+                        report["regression_reason"] = "sweep_timeout"
+                    elif not end_pass:
+                        report["regression_reason"] = "no_tests_collected"
+                    else:
+                        ftp_set = set(ftp)
+                        report["pass_to_pass"] = sorted((end_pass & start_pass) - ftp_set)
+                        report["regressions"] = sorted((start_pass - end_pass) - ftp_set)
+                        report["improved"] = sorted((end_pass - start_pass) - ftp_set)
+                        if report["regressions"]:
+                            report["outcome"] = "red_green_with_regression"
+                            report["verified"] = False
+                            report["reason"] = "regressions"
                 elif not end_pass:
                     # Swept fine and collected nothing -- a repo with no pytest
                     # (slime runs a hand-rolled `PASS <file>` harness), or a scope

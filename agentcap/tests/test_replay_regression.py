@@ -103,6 +103,28 @@ def main():
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    # ---- fallback scope when the directory collects nothing ---------------
+    # A single test file sitting directly under a huge directory makes the
+    # common ancestor that huge directory; on litellm that directory does not
+    # collect and #36999 lost its whole guard to it.
+    fb_cases = [
+        ("two files -> both, space joined",
+         {"test_files": ["tests/a/test_x.py", "tests/b/test_y.py"]}, "tests/a",
+         "tests/a/test_x.py tests/b/test_y.py"),
+        ("one file", {"test_files": ["tests/test_litellm/test_cost_calculator.py"]},
+         "tests/test_litellm", "tests/test_litellm/test_cost_calculator.py"),
+        ("no test files -> None", {"test_files": []}, "tests/x", None),
+        # never retry the identical target -- that is a guaranteed second failure
+        ("same as what already failed -> None",
+         {"test_files": ["tests/a/test_x.py"]}, "tests/a/test_x.py", None),
+    ]
+    for label, seed, tried, want in fb_cases:
+        got = R._regression_scope_fallback(seed, tried)
+        if got != want:
+            fails.append("fallback: %s -> %r (wanted %r)" % (label, got, want))
+        else:
+            print("[ok] fallback scope: %s" % label)
+
     # ---- grading: a guard is not counter-evidence -------------------------
     # The task contract asks for a guard covering neighbouring behaviour, and a
     # guard passes before the fix BY DEFINITION. Demanding every candidate be red
