@@ -122,9 +122,9 @@ def main():
         print("[ok] S5 TDD: end-authored test overlaid onto base, red verified")
 
     # --- S6 provenance: a bundle-able repo must stay self_contained ---
-    if rep.get("artifact_source") != "bundle" or rep.get("portability") != "self_contained":
+    if rep.get("artifact_source") != "bundle" or rep.get("artifact_portability") != "self_contained":
         fails.append("S6 healthy repo should replay from a bundle: %s/%s"
-                     % (rep.get("artifact_source"), rep.get("portability")))
+                     % (rep.get("artifact_source"), rep.get("artifact_portability")))
     elif rep.get("artifact_fallback_reason") is not None:
         fails.append("S6 no fallback reason expected: %s" % rep["artifact_fallback_reason"])
     else:
@@ -165,8 +165,11 @@ def main():
                      % (rep8a["outcome"], rep8a.get("error")))
     elif rep8a["artifact_source"] != "tree_snapshot":
         fails.append("S8a should degrade to a tree snapshot: %s" % rep8a["artifact_source"])
-    elif rep8a["portability"] != "self_contained":
-        fails.append("S8a history-free is still self-contained: %s" % rep8a["portability"])
+    elif rep8a.get("runtime_portability") not in ("same_class", "machine_local"):
+        fails.append("S8a runtime_portability must always be stated, got %r"
+                     % rep8a.get("runtime_portability"))
+    elif rep8a["artifact_portability"] != "self_contained":
+        fails.append("S8a history-free is still artifact-self_contained: %s" % rep8a["artifact_portability"])
     elif "413" not in (rep8a.get("artifact_fallback_reason") or ""):
         fails.append("S8a bundle failure not explained: %s"
                      % rep8a.get("artifact_fallback_reason"))
@@ -184,9 +187,9 @@ def main():
         R._bundle, R._tree_snapshot = real_bundle, real_tree
     if rep8["outcome"] != "red_green" or not rep8["verified"]:
         fails.append("S8 red/green must still be earned via local repo: %s" % rep8["outcome"])
-    elif rep8["artifact_source"] != "local_repo" or rep8["portability"] != "machine_local":
+    elif rep8["artifact_source"] != "local_repo" or rep8["artifact_portability"] != "machine_local":
         fails.append("S8 downgrade not recorded: %s/%s"
-                     % (rep8["artifact_source"], rep8["portability"]))
+                     % (rep8["artifact_source"], rep8["artifact_portability"]))
     elif "413" not in (rep8.get("artifact_fallback_reason") or ""):
         fails.append("S8 fallback reason not recorded: %s" % rep8.get("artifact_fallback_reason"))
     else:

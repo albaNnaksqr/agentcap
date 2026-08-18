@@ -9,6 +9,8 @@ Layout, self-contained (reconstructs WITHOUT the original repo):
         env/repo.bundle      git bundle carrying base_sha_start/end
         env/env_start|end/   manifest + diffs + runtime evidence
         env/blobs/           referenced untracked blobs
+        env/runtime_lock.txt pin list for the interpreter that earned `verified`
+                             (absent when there was nothing to promise)
 
 The task instance is the RL/DPO product: problem statement (the first user message
 that is not harness preamble), FAIL_TO_PASS/PASS_TO_PASS + observed test commands
@@ -40,8 +42,13 @@ _TIER = {"low": 0, "medium": 1, "high": 2}
 #     was empty by construction, so the field's meaning changed for consumers.
 #     Adds pass_to_pass_source / regression_scope / regression_reason /
 #     regressions to the task, and the matching counts to the record.
-RECORD_VERSION = 3
-TASK_VERSION = 3
+# v4: `portability` split into artifact_portability + runtime_portability. The old
+#     single field described the git tree while reading like a claim about the
+#     whole instance, and 17 of 20 verified instances only ran because of one
+#     machine's venv. env/runtime_lock.txt now ships the pin list for the
+#     interpreter that earned the verdict.
+RECORD_VERSION = 4
+TASK_VERSION = 4
 
 _SECRETS = [
     ("private_key", re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----')),
@@ -321,6 +328,14 @@ def _pack_env(session_dir, session, dest):
     if fell_back:
         source["read_from_object_source"] = True
     _write(os.path.join(dest, "source.json"), source)
+
+    # The pin list for the interpreter that earned the verdict. Tiny next to the
+    # trees beside it (1.4 KB against 49 MB for litellm) and it is the difference
+    # between a tree an RL consumer can rebuild and one it can rebuild but not
+    # run. Absent when replay had nothing to promise — see runtime_portability.
+    lock = os.path.join(session_dir, "runtime_lock.txt")
+    if os.path.exists(lock):
+        shutil.copyfile(lock, os.path.join(dest, "runtime_lock.txt"))
     for env in ("env_start", "env_end"):
         src, dst = os.path.join(session_dir, env), os.path.join(dest, env)
         os.makedirs(dst, exist_ok=True)
@@ -514,7 +529,9 @@ def export_session(session_dir, out, min_tier="medium"):
             task["replay_outcome"] = replay_rep.get("outcome")
             # a consumer that needs to rebuild the artifact elsewhere must be able
             # to tell an earned-but-machine-local verdict from a portable one
-            task["replay_portability"] = replay_rep.get("portability")
+            task["replay_artifact_portability"] = replay_rep.get("artifact_portability")
+            # the half that decides whether an RL consumer can run this at all
+            task["replay_runtime_portability"] = replay_rep.get("runtime_portability")
             _apply_regression_spec(task, replay_rep)
         _write(os.path.join(sdir, "task.json"), task)
 
@@ -539,7 +556,9 @@ def export_session(session_dir, out, min_tier="medium"):
                    ("verified", "benchmark_eligible", "join_confidence")},
         "replay": ({"outcome": replay_rep.get("outcome"),
                     "verified": replay_rep.get("verified"),
-                    "portability": replay_rep.get("portability"),
+                    "artifact_portability": replay_rep.get("artifact_portability"),
+                    "runtime_portability": replay_rep.get("runtime_portability"),
+                    "runtime_lock": replay_rep.get("runtime_lock"),
                     "artifact_source": replay_rep.get("artifact_source"),
                     "interpreter_source": replay_rep.get("interpreter_source"),
                     # counts here, full lists in task.json: the record is the

@@ -15,11 +15,27 @@ of the artifact degrades in tiers, and the tier is always stated:
                  history-free — so the base is checked by tree hash, not by
                  checking out base_sha
   local_repo     the live repo; red/green is still EARNED, but only reproducible
-                 on this machine, so portability drops to machine_local. Opt-in.
+                 on this machine, so artifact_portability drops to machine_local.
+                 Opt-in.
 
-See `artifact_source` / `portability` / `artifact_fallback_reason` /
-`interpreter_source` in the report.
+Portability is TWO questions, kept apart because conflating them let the export
+claim self_contained for instances whose tests only ran thanks to one machine's
+venv:
+
+  artifact_portability  can the source tree be rebuilt elsewhere (the tiers above)
+  runtime_portability   can the environment that RUNS the tests be rebuilt
+                        `same_class` when a pin list was captured (venv/conda) and
+                        the machine is of the same class; `machine_local` for a
+                        distro python, which a freeze describes but cannot rebuild
+
+agentcap still does not BUILD an environment — it records the lock. Verified
+2026-08-18: a fresh venv built from nothing but that lock re-earned red_green on
+all 14 litellm sessions with identical pass_to_pass counts.
+
+See `artifact_source` / `artifact_portability` / `runtime_portability` /
+`runtime_lock` / `artifact_fallback_reason` / `interpreter_source` in the report.
 """
+import hashlib
 import json
 import os
 import re
@@ -34,7 +50,7 @@ from . import testparse
 from .export import _bundle, _tree_snapshot
 from .verify import reconstruct
 
-REPLAY_VERSION = 2
+REPLAY_VERSION = 3
 DEFAULT_TIMEOUT = 300
 
 
@@ -92,6 +108,67 @@ def _sweep(python, tree, scope, timeout, pythonpath=None):
     except subprocess.TimeoutExpired:
         return set(), False
     return testparse.parse(p.stdout + p.stderr, "pytest")["passed"], True
+
+
+def _runtime_kind(python):
+    """venv | conda | system — how the interpreter was provisioned.
+
+    Decides what may be PROMISED about rebuilding it. A venv or conda env is
+    reconstructable from a pin list on a same-class machine; a distro python's
+    site-packages is not, and freezing it would describe the host rather than a
+    rebuildable environment."""
+    d = os.path.dirname(os.path.dirname(os.path.abspath(python)))
+    if os.path.exists(os.path.join(d, "pyvenv.cfg")):
+        return "venv"
+    if os.path.isdir(os.path.join(d, "conda-meta")):
+        return "conda"
+    return "system"
+
+
+# Lines a pin list cannot carry to another machine. The project under test is the
+# usual one: it is installed editable, and replay must import the RECONSTRUCTED
+# tree anyway (PYTHONPATH beats a legacy .pth), so shipping its editable line
+# would be both useless and a way to accidentally test the live clone.
+_UNPINNABLE = re.compile(r'^-e\s|@\s*file://|@\s*git\+|\s@\s*/')
+
+
+def _runtime_lock(python):
+    """-> (lock_text, info) for the interpreter, or (None, info) when it cannot
+    be promised.
+
+    This is the half of "reproducible elsewhere" agentcap never wrote down. The
+    export ships gigabytes of repo tree and omitted the ~1.4 KB that makes the
+    tree runnable: 17 of 20 verified instances only earned `verified` via a venv
+    path that exists on one machine. Measured 2026-08-18 — a fresh venv built
+    from nothing but this lock re-earned red_green on all 14 litellm sessions
+    with byte-identical pass_to_pass counts.
+
+    Excluded lines are reported, never dropped silently: a lock that quietly
+    omits something is the same over-claim in a new place."""
+    kind = _runtime_kind(python)
+    info = {"kind": kind, "packages": 0, "sha256": None, "excluded": []}
+    if kind == "system":
+        # A distro python is not rebuildable from a freeze; say so instead of
+        # shipping a pin list that describes the host.
+        return None, info
+    try:
+        p = subprocess.run([python, "-m", "pip", "freeze"],
+                           capture_output=True, text=True, timeout=120)
+    except (subprocess.TimeoutExpired, OSError):
+        return None, info
+    if p.returncode != 0:
+        return None, info
+    keep, drop = [], []
+    for line in p.stdout.splitlines():
+        if not line.strip():
+            continue
+        (drop if _UNPINNABLE.search(line) else keep).append(line)
+    if not keep:
+        return None, info
+    text = "\n".join(keep) + "\n"
+    info.update(packages=len(keep), excluded=drop,
+                sha256=hashlib.sha256(text.encode()).hexdigest()[:16])
+    return text, info
 
 
 def _grade(tests):
@@ -344,7 +421,14 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None,
         "replay_version": REPLAY_VERSION, "outcome": "setup_failed",
         "verified": False, "reason": None, "error": None, "tests": [],
         "overlaid_test_files": [], "python": None,
-        "artifact_source": None, "portability": None,
+        "artifact_source": None,
+        # Two different questions, and conflating them under one `portability`
+        # was how the export came to claim self_contained for 17 instances whose
+        # tests only ran because of one machine's venv.
+        #   artifact_portability  can the SOURCE TREE be rebuilt elsewhere
+        #   runtime_portability   can the ENVIRONMENT that runs the tests be
+        "artifact_portability": None, "runtime_portability": None,
+        "runtime_lock": None,
         "artifact_fallback_reason": None, "interpreter_source": None,
         "interpreter_fallback_reason": None,
         # regression half of the verifier spec: tests that pass at BOTH ends
@@ -371,8 +455,8 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None,
         start_tree = None
         source, kind, fb_reason = _artifact_source(session, workdir, allow_local_repo)
         report["artifact_source"] = kind
-        report["portability"] = ("machine_local" if kind == "local_repo"
-                                 else "self_contained")
+        report["artifact_portability"] = ("machine_local" if kind == "local_repo"
+                                          else "self_contained")
         report["artifact_fallback_reason"] = fb_reason
 
         # GREEN first (fail fast): the END state must run every ftp test green
@@ -429,6 +513,17 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None,
             if any(t["start_status"] == "timeout" for t in runnable):
                 report.update(tests=tests, reason="timeout")
                 return report
+        # After the interpreter is final: the recorded-interpreter fallback can
+        # replace it, and the lock has to describe whatever actually ran.
+        lock_text, lock_info = _runtime_lock(python)
+        report["runtime_lock"] = lock_info
+        if lock_text:
+            with open(os.path.join(session_dir, "runtime_lock.txt"), "w") as f:
+                f.write(lock_text)
+            report["runtime_portability"] = "same_class"
+        else:
+            report["runtime_portability"] = "machine_local"
+
         report["tests"] = tests
         report["outcome"], report["verified"], report["reason"] = _grade(tests)
         report["guards_in_ftp"] = sorted(t["node_id"] for t in tests
