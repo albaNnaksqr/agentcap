@@ -24,9 +24,11 @@ venv:
 
   artifact_portability  can the source tree be rebuilt elsewhere (the tiers above)
   runtime_portability   can the environment that RUNS the tests be rebuilt
-                        `same_class` when a pin list was captured (venv/conda) and
-                        the machine is of the same class; `machine_local` for a
-                        distro python, which a freeze describes but cannot rebuild
+                        `same_class` only when a venv pin list was captured and the
+                        machine is of the same class. `machine_local` for a distro
+                        python (a freeze describes the host) and for conda, whose
+                        freeze does not install at all — proven by a consumer on
+                        2026-08-19, not assumed
 
 agentcap still does not BUILD an environment — it records the lock. Verified
 2026-08-18: a fresh venv built from nothing but that lock re-earned red_green on
@@ -539,11 +541,17 @@ def replay_session(session_dir, timeout=DEFAULT_TIMEOUT, python=None,
         # replace it, and the lock has to describe whatever actually ran.
         lock_text, lock_info = _runtime_lock(python)
         report["runtime_lock"] = lock_info
+        lock_path = os.path.join(session_dir, "runtime_lock.txt")
         if lock_text:
-            with open(os.path.join(session_dir, "runtime_lock.txt"), "w") as f:
+            with open(lock_path, "w") as f:
                 f.write(lock_text)
             report["runtime_portability"] = "same_class"
         else:
+            # A stale lock from an earlier run would ship alongside
+            # runtime_portability=machine_local and contradict it. New code being
+            # right does not make leftover state honest.
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
             report["runtime_portability"] = "machine_local"
 
         report["tests"] = tests
