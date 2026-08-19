@@ -28,6 +28,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 
 from . import gitutil as g
 from . import session as sess
@@ -47,8 +48,12 @@ _TIER = {"low": 0, "medium": 1, "high": 2}
 #     whole instance, and 17 of 20 verified instances only ran because of one
 #     machine's venv. env/runtime_lock.txt now ships the pin list for the
 #     interpreter that earned the verdict.
-RECORD_VERSION = 4
-TASK_VERSION = 4
+# v5: fail_to_pass no longer contains guards (they were in BOTH lists, which no
+#     consumer can honour); guards_moved_from_ftp records the move. A conda
+#     runtime is machine_local -- a pip freeze of it does not install. Bundles are
+#     clone-verified before being shipped.
+RECORD_VERSION = 5
+TASK_VERSION = 5
 
 _SECRETS = [
     ("private_key", re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----')),
@@ -271,6 +276,33 @@ def _blob_path(cas_root, oid):
     return os.path.join(cas_root, oid[:2], oid[2:])
 
 
+def _assert_bundle_usable(bundle, shas):
+    """Raise unless a consumer can actually clone this bundle and reach the bases.
+
+    `git bundle create` can succeed and still write a bundle nobody can use: the
+    sglang-omni#1360 export shipped one for eleven days that dies on
+    `error: Could not read 0f8718...` / `Failed to traverse parents`, while its
+    record claimed artifact_portability self_contained. The producer's own success
+    is not evidence — only the consumer's operation is, so run that operation
+    here. --no-checkout keeps it cheap: object transfer is what fails, not the
+    worktree write."""
+    tmp = tempfile.mkdtemp(prefix="agentcap-bundlecheck-")
+    try:
+        p = subprocess.run(["git", "clone", "--quiet", "--no-checkout", bundle,
+                            os.path.join(tmp, "c")],
+                           capture_output=True, text=True, timeout=1800)
+        if p.returncode != 0:
+            raise RuntimeError("bundle is not cloneable: %s"
+                               % (p.stderr or p.stdout).strip().splitlines()[0][:200])
+        for sha in {s for s in shas if s}:
+            q = subprocess.run(["git", "-C", os.path.join(tmp, "c"), "cat-file", "-e",
+                                "%s^{tree}" % sha], capture_output=True)
+            if q.returncode != 0:
+                raise RuntimeError("bundle clones but lacks the tree of %s" % sha[:12])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _bundle(repo, shas, dest):
     """Bundle the session's base commits behind temp refs (bundles need refnames)."""
     refs = []
@@ -319,10 +351,15 @@ def _pack_env(session_dir, session, dest):
     repo, fell_back = sess.resolve_repo(session)
     try:
         _bundle(repo, shas, os.path.join(dest, "repo.bundle"))
+        _assert_bundle_usable(os.path.join(dest, "repo.bundle"), shas)
         source = {"kind": "bundle", "path": "repo.bundle"}
     except Exception as e:
         # keep self-containment, drop history — see _tree_snapshot
         trees = _tree_snapshot(repo, shas, os.path.join(dest, "trees"))
+        # remove the unusable bundle so nothing downstream can pick it up
+        stale = os.path.join(dest, "repo.bundle")
+        if os.path.exists(stale):
+            os.remove(stale)
         source = {"kind": "tree_snapshot", "trees": trees,
                   "bundle_error": str(e).strip().splitlines()[0] if str(e).strip() else ""}
     if fell_back:
@@ -430,6 +467,26 @@ def _apply_regression_spec(task, replay_rep):
     else:
         # keep whatever the seed had (in practice []), and say why
         task["pass_to_pass_source"] = "session_log"
+
+    # A guard cannot be in BOTH lists. taskseed misclassifies guards as
+    # fail_to_pass (they do flip red->green once during development), replay
+    # detects them and folds them into pass_to_pass, and until now the SHIPPED
+    # spec kept them in fail_to_pass as well. Any consumer applying the standard
+    # rule "every FAIL_TO_PASS must fail before the patch" then rejects the
+    # instance or computes a wrong reward. Fixing the grade was not fixing the
+    # artifact -- found 2026-08-19 by a loader that reads only the export.
+    guards = [g for g in (replay_rep.get("guards_in_ftp") or [])]
+    if guards:
+        gset = set(guards)
+        kept = [n for n in (task.get("fail_to_pass") or []) if n not in gset]
+        # never empty the verifier spec: if every candidate is a guard the session
+        # is green_only and not verified anyway, but do not corrupt it here.
+        if kept:
+            task["fail_to_pass"] = kept
+        # guards belong in pass_to_pass whatever the sweep managed to do, so the
+        # witness replay proved directly is never lost to a failed sweep
+        task["pass_to_pass"] = sorted(set(task.get("pass_to_pass") or []) | gset)
+        task["guards_moved_from_ftp"] = guards
     task["regression_scope"] = scope
     task["regression_reason"] = reason
     # non-empty means `verified` is already False; shipped so a consumer can see

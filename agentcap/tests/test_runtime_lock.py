@@ -48,8 +48,21 @@ def main():
         text, info = R._runtime_lock("/usr/bin/python3")
         if text is not None or info["kind"] != "system":
             fails.append("a system interpreter was given a lock: %r" % info)
+        elif not info.get("unreproducible_reason"):
+            fails.append("no reason given for refusing a system interpreter")
         else:
-            print("[ok] a distro python yields no lock, kind=system")
+            print("[ok] a distro python yields no lock, kind=system, reason stated")
+
+        # conda: a pip freeze of it does not install -- proven by a consumer on
+        # 2026-08-19, so it must not be shipped as a recipe either
+        cpy = os.path.join(conda, "bin", "python")
+        text, info = R._runtime_lock(cpy)
+        if text is not None:
+            fails.append("a conda env was given a lock: %r" % info)
+        elif not info.get("unreproducible_reason"):
+            fails.append("no reason given for refusing a conda env")
+        else:
+            print("[ok] a conda env yields no lock, reason stated")
 
         # ---- the unpinnable filter -------------------------------------------
         cases = [
@@ -88,6 +101,8 @@ def main():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
+    fails += guards_and_bundles()
+
     print("-" * 50)
     if fails:
         print("FAIL (%d):" % len(fails))
@@ -95,6 +110,74 @@ def main():
             print("  - " + f)
         sys.exit(1)
     print("ALL PASS")
+
+
+
+
+def guards_and_bundles():
+    """The two defects an independent consumer found on 2026-08-19, plus the conda
+    one. Kept in this file because all three are about not promising more than the
+    artifact can deliver."""
+    import json as _json
+    from agentcap.export import _apply_regression_spec, _assert_bundle_usable
+    fails = []
+
+    G = "tests/t.py::TestX::test_guard"
+    F = "tests/t.py::TestX::test_fix"
+
+    # A guard was in BOTH fail_to_pass and pass_to_pass. No consumer can honour
+    # that: the standard rule is "every FAIL_TO_PASS fails before the patch".
+    task = {"fail_to_pass": [F, G], "pass_to_pass": []}
+    _apply_regression_spec(task, {"regression_scope": "tests", "regression_reason": None,
+                                  "pass_to_pass": [G, "tests/t.py::other"],
+                                  "regressions": [], "guards_in_ftp": [G]})
+    if G in task["fail_to_pass"]:
+        fails.append("guard still in fail_to_pass")
+    elif task["fail_to_pass"] != [F]:
+        fails.append("fail_to_pass wrong after the move: %r" % task["fail_to_pass"])
+    elif G not in task["pass_to_pass"]:
+        fails.append("guard did not land in pass_to_pass")
+    elif task.get("guards_moved_from_ftp") != [G]:
+        fails.append("the move was not recorded")
+    else:
+        print("[ok] a guard moves out of fail_to_pass into pass_to_pass, recorded")
+
+    # the witness must survive a sweep that produced nothing
+    task = {"fail_to_pass": [F, G], "pass_to_pass": []}
+    _apply_regression_spec(task, {"regression_scope": "tests",
+                                  "regression_reason": "no_tests_collected",
+                                  "pass_to_pass": [G], "regressions": [],
+                                  "guards_in_ftp": [G]})
+    if G not in task.get("pass_to_pass", []):
+        fails.append("guard lost when the sweep collected nothing")
+    else:
+        print("[ok] the guard witness survives a failed sweep")
+
+    # never empty the spec, even if every candidate looks like a guard
+    task = {"fail_to_pass": [G], "pass_to_pass": []}
+    _apply_regression_spec(task, {"regression_scope": None, "regression_reason": None,
+                                  "pass_to_pass": [], "regressions": [],
+                                  "guards_in_ftp": [G]})
+    if not task["fail_to_pass"]:
+        fails.append("fail_to_pass was emptied")
+    else:
+        print("[ok] fail_to_pass is never emptied by the move")
+
+    # A bundle the producer wrote successfully but no consumer can clone must be
+    # rejected here rather than shipped (sglang-omni#1360 shipped one for 11 days).
+    tmp = tempfile.mkdtemp(prefix="agentcap-bundletest-")
+    try:
+        junk = os.path.join(tmp, "broken.bundle")
+        open(junk, "wb").write(b"# v2 git bundle\nnot really a bundle\n")
+        try:
+            _assert_bundle_usable(junk, ["0" * 40])
+            fails.append("an unusable bundle passed the check")
+        except RuntimeError:
+            print("[ok] an unusable bundle is rejected instead of shipped")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    return fails
 
 
 if __name__ == "__main__":

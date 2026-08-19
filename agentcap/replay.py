@@ -146,10 +146,32 @@ def _runtime_lock(python):
     Excluded lines are reported, never dropped silently: a lock that quietly
     omits something is the same over-claim in a new place."""
     kind = _runtime_kind(python)
-    info = {"kind": kind, "packages": 0, "sha256": None, "excluded": []}
+    info = {"kind": kind, "packages": 0, "sha256": None, "excluded": [],
+            "unreproducible_reason": None}
     if kind == "system":
         # A distro python is not rebuildable from a freeze; say so instead of
         # shipping a pin list that describes the host.
+        info["unreproducible_reason"] = "distro python: a freeze describes the host"
+        return None, info
+    if kind == "conda":
+        # Treating conda like a venv was an untested assumption, and an
+        # independent consumer disproved it on 2026-08-19: `pip install -r` of the
+        # sglang env's freeze fails outright. A conda freeze is not a recipe --
+        # conda-installed packages are absent from it, pip cannot resolve the ones
+        # that are, and it records no index URL, so `torch==2.11.0` loses the
+        # +cu130 build it actually needs. Evidence, not a promise: the count is
+        # recorded and no lock file is written, so "lock present" keeps meaning
+        # "rebuildable".
+        info["unreproducible_reason"] = (
+            "conda env: pip freeze is not a rebuild recipe (conda-installed "
+            "packages missing, no index URL, local +cuXXX builds unresolvable)")
+        try:
+            p = subprocess.run([python, "-m", "pip", "freeze"],
+                               capture_output=True, text=True, timeout=120)
+            info["evidence_packages"] = len(
+                [l for l in p.stdout.splitlines() if l.strip()]) if p.returncode == 0 else 0
+        except (subprocess.TimeoutExpired, OSError):
+            info["evidence_packages"] = 0
         return None, info
     try:
         p = subprocess.run([python, "-m", "pip", "freeze"],
