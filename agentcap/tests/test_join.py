@@ -100,6 +100,8 @@ def main():
     else:
         print("[ok] low join stays fuel-only (not benchmark-eligible)")
 
+    fails += gate_cases()
+
     print("-" * 50)
     if fails:
         print("FAIL (%d):" % len(fails))
@@ -112,6 +114,64 @@ def main():
 def sess_epoch(s, key):
     from agentcap.trajectory import epoch
     return epoch(s.get(key))
+
+
+
+
+def gate_cases():
+    """The cwd gate: an unrelated working directory disqualifies a candidate.
+
+    Regression for 16 sessions paired across unrelated projects on time overlap
+    alone (papyrus capture <- claimagent log, trajmill capture <- papyrus log),
+    three of which reached an export.
+    """
+    from agentcap.join import score, _cwd_related
+    fails = []
+    T0, T1 = 1000, 2000
+
+    def sess(repo):
+        return {"repo": repo, "agent": "claude", "extra": {},
+                "created_at": "2026-08-20T10:00:00+00:00",
+                "closed_at": "2026-08-20T10:30:00+00:00"}
+
+    def traj(cwd):
+        # overlapping window, so time_overlap alone would have joined it before
+        return {"agent": "claude", "session_id": "x", "cwd": cwd,
+                "log_path": "/l.jsonl", "first_ts": 0, "last_ts": 10 ** 12}
+
+    for label, cwd, repo, want in [
+        ("same dir", "/w/papyrus", "/w/papyrus", "cwd"),
+        ("agent cd'd into a subdir", "/w/papyrus/tests", "/w/papyrus", "related"),
+        ("agent started one level up", "/w", "/w/papyrus", "related"),
+        ("unrelated sibling", "/w/claimagent", "/w/papyrus", "reject"),
+        ("unrelated absolute", "/tmp/other", "/w/papyrus", "reject"),
+        # the prefix must be path-wise, not string-wise
+        ("string prefix but different dir", "/w/papyrus-old", "/w/papyrus", "reject"),
+    ]:
+        conf, sig = score(sess(repo), traj(cwd))
+        if want == "cwd":
+            ok = conf == "medium" and "cwd" in sig
+        elif want == "related":
+            ok = conf == "low" and sig == ["time_overlap"]
+        else:
+            ok = conf is None and sig == ["cwd_disjoint"]
+        if not ok:
+            fails.append("cwd gate: %s -> conf=%r signals=%r" % (label, conf, sig))
+        else:
+            print("[ok] cwd gate: %s" % label)
+
+    # a log that records no cwd at all is unknown, not disqualified
+    conf, sig = score(sess("/w/papyrus"), {**traj("/w/claimagent"), "cwd": None})
+    if conf != "low" or sig != ["time_overlap"]:
+        fails.append("a cwd-less log should stay joinable on time alone: %r %r" % (conf, sig))
+    else:
+        print("[ok] cwd gate: a log with no recorded cwd is unknown, not refused")
+
+    if not _cwd_related("/w/papyrus", "/w/papyrus-old"):
+        print("[ok] cwd gate: path-wise prefix, not string-wise")
+    else:
+        fails.append("_cwd_related treated a string prefix as a path prefix")
+    return fails
 
 
 if __name__ == "__main__":
