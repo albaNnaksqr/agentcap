@@ -93,7 +93,9 @@ def _codex_exec_cmd(input_str):
     return val if isinstance(val, str) else None
 
 
-def claude_runs(path):
+def _claude_raw(path):
+    """Parse a claude log into (calls, outputs, order) -- shared by the test-run
+    view and the full command view, so both see exactly the same events."""
     calls, outputs, order = {}, {}, []
     for line in _lines(path):
         d = _loads(line)
@@ -113,10 +115,15 @@ def claude_runs(path):
                 order.append(b.get("id"))
             elif b.get("type") == "tool_result":
                 outputs[b.get("tool_use_id")] = _text(b.get("content"))
-    return _pair(calls, outputs, order)
+    return calls, outputs, order
 
 
-def codex_runs(path):
+def claude_runs(path):
+    return _pair(*_claude_raw(path))
+
+
+def _codex_raw(path):
+    """Parse a codex log into (calls, outputs, order, waits). See _claude_raw."""
     calls, outputs, order = {}, {}, []
     waits = {}   # call_id of a `wait` -> the cell id it is collecting
     for line in _lines(path):
@@ -159,6 +166,11 @@ def codex_runs(path):
             out = p.get("output")
             txt = out if isinstance(out, str) else _text(out)
             outputs[p.get("call_id")] = _unwrap_codex_envelopes(txt)
+    return calls, outputs, order, waits
+
+
+def codex_runs(path):
+    calls, outputs, order, waits = _codex_raw(path)
     _stitch_yielded_cells(outputs, order, waits)
     return _pair(calls, outputs, order)
 
@@ -255,16 +267,50 @@ def _stitch_yielded_cells(outputs, order, waits):
             pending[m.group(1)] = cid
 
 
-def _pair(calls, outputs, order):
+def _pair(calls, outputs, order, framework_only=True):
     runs = []
     for i, cid in enumerate(order):
         cmd, ts = calls.get(cid, (None, None))
+        if cmd is None:
+            continue
         fw = testparse.detect_framework(cmd)
-        if fw is None:
+        if framework_only and fw is None:
             continue
         runs.append({"cmd": cmd, "output": outputs.get(cid, ""), "ts": ts, "idx": i,
                      "framework": fw})
     return runs
+
+
+def shell_commands(path, agent):
+    """EVERY shell command the agent ran, not just the test runs.
+
+    The task contract forbids some commands outright (git commit/add/stash/
+    checkout) because they destroy the uncommitted diff the harness reads to
+    attribute authorship. Until now the contract only STATED the rule -- nothing
+    detected a violation, and one happened: sglang#35564's headless run used
+    `git stash push` three times to check its test went red. No damage that time
+    (the pops all succeeded), but a failed pop, or a mark-end landing mid-stash,
+    would have left an empty or partial delta.
+
+    Checking the git state afterwards cannot find this -- a popped stash leaves
+    nothing behind. The trajectory is the only record of what was actually run."""
+    if agent == "claude":
+        return _all_claude(path)
+    if agent == "codex":
+        return _all_codex(path)
+    c, x = _all_claude(path), _all_codex(path)
+    return c if len(c) >= len(x) else x
+
+
+def _all_claude(path):
+    calls, outputs, order = _claude_raw(path)
+    return _pair(calls, outputs, order, framework_only=False)
+
+
+def _all_codex(path):
+    calls, outputs, order, waits = _codex_raw(path)
+    _stitch_yielded_cells(outputs, order, waits)
+    return _pair(calls, outputs, order, framework_only=False)
 
 
 def test_runs(path, agent):

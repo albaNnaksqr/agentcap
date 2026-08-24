@@ -191,6 +191,37 @@ def main():
     else:
         print("[ok] env unverified -> grounded label kept but capped at medium")
 
+    # --- contract violations read off the trajectory ------------------------
+    # The contract forbade these commands and nothing detected a breach; one
+    # happened (sglang#35564 ran `git stash push` three times). A popped stash
+    # leaves no trace in the repo, so the trajectory is the only record.
+    from agentcap.value import _FORBIDDEN_GIT as _FG
+    for cmd, want in [
+        ("git stash push a.py -q", True),
+        ("git stash", True),                       # bare stash IS push
+        ("git commit -m x", True),
+        ("git add -A", True),
+        ("git checkout main", True),
+        ("git restore f", True),
+        # a flag that takes a VALUE must not hide the verb
+        ("git -C /r reset --hard", True),
+        ("git -c user.email=a@b commit -m x", True),
+        ("git --git-dir=/g add .", True),
+        ("cd t && git stash push x", True),
+        # read-only git is not a violation
+        ("git stash list", False), ("git stash show", False),
+        ("git status --short", False), ("git diff --stat", False),
+        ("git log -1", False), ("git rev-parse HEAD", False),
+        ("git check-ignore tests/x.py", False), ("git worktree list", False),
+        ("git ls-files", False),
+        ("digit add", False),                      # word boundary
+    ]:
+        if bool(_FG.search(cmd)) != want:
+            fails.append("contract regex: %r -> %s (wanted %s)" % (cmd, not want, want))
+    if not any(f.startswith("contract regex") for f in fails):
+        print("[ok] forbidden git ops detected; read-only git and word-boundary "
+              "lookalikes are not flagged")
+
     print("-" * 50)
     if fails:
         print("FAIL (%d):" % len(fails))

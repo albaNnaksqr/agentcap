@@ -35,6 +35,38 @@ from .snapshot import load_manifest  # noqa: F401 (kept for parity / future grou
 
 _ERR = re.compile(r'\b([A-Z][A-Za-z0-9]*Error)\b')
 
+# Commands the task contract forbids, because each one destroys the uncommitted
+# diff the harness reads to attribute test authorship. `--dry-run` and
+# `stash list/show` inspect without mutating, so they are not violations.
+# The (?:-C|-c) branch must come FIRST and swallow its VALUE: `git -C /repo reset`
+# otherwise leaves `/repo` where the verb is expected and the match is lost. -C is
+# uppercase, so a lowercase-only branch misses it entirely.
+_FORBIDDEN_GIT = re.compile(
+    r'\bgit\s+(?:(?:-C|-c)\s+\S+\s+|--\S+\s+|-\S+\s+)*'
+    r'(commit|add|stash\s+(?:push|save|-u|--)|stash(?!\s+(?:list|show))|checkout|reset|restore)\b')
+
+
+def contract_violations(log_path, agent):
+    """Forbidden commands the session actually ran, with their timestamps.
+
+    The contract only STATED these rules; nothing detected a breach, and one
+    happened -- sglang#35564's headless run used `git stash push` three times to
+    confirm its new test went red. No damage that time because every pop
+    succeeded, but a failed pop, or a mark-end landing mid-stash, leaves an empty
+    or partial delta, and delta is taskseed's only evidence of authorship.
+
+    Checked against the TRAJECTORY, not the repo afterwards: a popped stash
+    leaves nothing behind, so the git state cannot answer this. Recorded, never
+    acted on -- this reports what the session did and lets a consumer decide."""
+    out = []
+    for c in tooltrace.shell_commands(log_path, agent):
+        cmd = c.get("cmd") or ""
+        for m in _FORBIDDEN_GIT.finditer(cmd):
+            out.append({"op": m.group(1).split()[0], "ts": c.get("ts"),
+                        "cmd": " ".join(cmd.split())[:200]})
+            break
+    return out
+
 # richness/focus count CODE only — docs, brainstorm artifacts, pid/state, .env
 # examples etc. are churn that inflates size without being problem-solving.
 _CODE_EXTS = {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".rb",
@@ -175,6 +207,7 @@ def assess(session_dir):
             "frameworks": sorted({r.get("framework") for r in runs if r.get("framework")}),
             "red_green_transitions": transitions,
             "error_types": sorted(errors),
+            "contract_violations": contract_violations(log, agent),
             "observed_failure": had_failure,
             "ended_green": ended_green,
             # index (in ts order) of the run ended_green was read from, and how
