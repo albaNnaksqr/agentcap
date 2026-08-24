@@ -547,6 +547,13 @@ def export_session(session_dir, out, min_tier="medium"):
     join = _load(os.path.join(session_dir, "join.json"))
     if not join:
         return "skipped", "no_join"
+    if not join.get("trajectory"):
+        # Since 2073fd3 a refused join is RECORDED rather than left absent, so the
+        # file exists and is truthy while carrying no trajectory. Carry the reason
+        # out: "unjoined: cwd_disjoint" tells a reader the capture had candidates
+        # and every one of them ran somewhere unrelated, which a bare "no_join"
+        # would flatten into "we never looked".
+        return "skipped", "unjoined: %s" % (join.get("unjoined_reason") or "no_reason")
     val = _load(os.path.join(session_dir, "value.json")) or V.assess(session_dir)
     if not val:
         return "skipped", "no_value"

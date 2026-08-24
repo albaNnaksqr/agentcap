@@ -390,6 +390,28 @@ def main():
     else:
         print("[ok] joinless session skipped with reason")
 
+    # a refused join is a recorded fact, not an absent file -- export must skip it
+    # with the reason instead of crashing on trajectory=None
+    import tempfile as _tf, json as _j, os as _os
+    d=_tf.mkdtemp(prefix="agentcap-unjoined-")
+    _j.dump({"join_confidence":None,"signals":[],"trajectory":None,
+             "unjoined_reason":"cwd_disjoint"}, open(_os.path.join(d,"join.json"),"w"))
+    _j.dump({"session_id":"s","repo":d,"agent":"claude","cas_root":d,"status":"closed",
+             "base_sha_start":"0"*40,"base_sha_end":"0"*40,"created_at":None,
+             "closed_at":None,"start_confidence":"high","end_confidence":"high"},
+            open(_os.path.join(d,"session.json"),"w"))
+    _j.dump({"added":[],"modified":[],"deleted":[]}, open(_os.path.join(d,"delta.json"),"w"))
+    try:
+        st, why = E.export_session(d, d, "medium")
+    except TypeError as e:
+        # the exact crash this guards: traj["log_path"] on trajectory=None
+        fails.append("export crashed on an unjoined session: %s" % e); st=why=None
+    if st == "skipped" and why and why.startswith("unjoined"):
+        print("[ok] an unjoined session is skipped with its reason (%s), not crashed on" % why)
+    else:
+        fails.append("unjoined session -> (%r, %r)" % (st, why))
+    import shutil as _sh; _sh.rmtree(d, ignore_errors=True)
+
     print("-" * 50)
     if fails:
         print("FAIL (%d):" % len(fails))
