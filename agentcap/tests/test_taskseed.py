@@ -321,6 +321,44 @@ def main():
     else:
         print("[ok] added-test extraction: additions only, params and dotted ids handled")
 
+    # --- authored tests living in a NEW file -------------------------------
+    # git diff covers tracked files only, so a brand-new test file produces no
+    # hunk and the narrowing silently did not apply (sglang#35564: authored 0).
+    import tempfile as _tf, json as _j, os as _os, hashlib as _h, shutil as _sh
+    from agentcap.taskseed import _added_test_names
+    d = _tf.mkdtemp(prefix="agentcap-newfile-")
+    cas = _os.path.join(d, "cas"); _os.makedirs(cas)
+    body = "import pytest\n\n\ndef test_brand_new():\n    assert True\n\n\nasync def test_async_new():\n    assert True\n"
+    # store it the way snapshot does: CAS at oid[:2]/oid[2:]
+    oid = _h.sha1(("blob %d\0" % len(body)).encode() + body.encode()).hexdigest()
+    _os.makedirs(_os.path.join(cas, oid[:2]), exist_ok=True)
+    open(_os.path.join(cas, oid[:2], oid[2:]), "w").write(body)
+    _os.makedirs(_os.path.join(d, "env_end"))
+    _j.dump({"added": ["tests/test_new.py"], "modified": [], "deleted": []},
+            open(_os.path.join(d, "delta.json"), "w"))
+    _j.dump({"meta": {}, "entries": [
+        {"path": "tests/test_new.py", "type": "file", "status": "present",
+         "untracked": True, "content_hash": oid}]},
+        open(_os.path.join(d, "env_end", "manifest.json"), "w"))
+    got = _added_test_names(d, {"cas_root": cas})
+    if got != {"test_brand_new", "test_async_new"}:
+        fails.append("new-file authored tests not found: %r" % sorted(got))
+    else:
+        print("[ok] authored tests are read from a newly CREATED file, not just diffs")
+
+    # a new file that is NOT a test file must not contribute names
+    _j.dump({"added": ["src/helper.py"], "modified": [], "deleted": []},
+            open(_os.path.join(d, "delta.json"), "w"))
+    _j.dump({"meta": {}, "entries": [
+        {"path": "src/helper.py", "type": "file", "status": "present",
+         "untracked": True, "content_hash": oid}]},
+        open(_os.path.join(d, "env_end", "manifest.json"), "w"))
+    if _added_test_names(d, {"cas_root": cas}):
+        fails.append("a non-test new file contributed authored test names")
+    else:
+        print("[ok] a new non-test file contributes nothing")
+    _sh.rmtree(d, ignore_errors=True)
+
     print("-" * 50)
     if fails:
         print("FAIL (%d):" % len(fails))

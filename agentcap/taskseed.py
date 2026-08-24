@@ -146,10 +146,58 @@ def _timeline(runs):
 # pre-existing test as authored. That silently defeats the narrowing this whole
 # function exists to provide. Seen on litellm#36197.
 _ADDED_TEST_RE = re.compile(r"^\+[^\S\n]*(?:async[^\S\n]+)?def[^\S\n]+(test_\w+)", re.M)
+# Same shape without the diff's leading '+', for reading a whole new file.
+_TEST_DEF_RE = re.compile(r"^[^\S\n]*(?:async[^\S\n]+)?def[^\S\n]+(test_\w+)", re.M)
+
+
+def _names_from_new_files(session_dir, session):
+    """Test functions in files this session CREATED.
+
+    `git diff` covers tracked files only, so a brand-new test file produces no
+    hunk and the diff-based scan returns nothing — the narrowing then silently
+    does not apply. Any session whose tests live in a new file was affected, e.g.
+    sglang#35564 (authored_tests 0 while the codex captures had 3-4) whose whole
+    test suite was one new file.
+
+    The content IS captured: delta.added names the file and the end manifest
+    carries its blob hash, so read it out of the CAS. This is not a fallback for
+    a missing diff — new files and edited files are simply recorded in different
+    places, and both have to be read."""
+    names = set()
+    delta = _load_json(os.path.join(session_dir, "delta.json")) or {}
+    added = [p for p in (delta.get("added") or []) if _looks_test(p)]
+    if not added:
+        return names
+    man = _load_json(os.path.join(session_dir, "env_end", "manifest.json")) or {}
+    by_path = {e["path"]: e for e in man.get("entries", []) if e.get("path")}
+    cas = (session or {}).get("cas_root")
+    if not cas:
+        return names
+    for rel in added:
+        ent = by_path.get(rel)
+        if not ent or ent.get("status") != "present" or not ent.get("content_hash"):
+            continue
+        h = ent["content_hash"]
+        blob = os.path.join(cas, h[:2], h[2:])
+        try:
+            text = open(blob, "rb").read().decode(errors="ignore")
+        except OSError:
+            continue
+        names |= set(_TEST_DEF_RE.findall(text))
+    return names
+
+
+def _load_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
 
 
 def _added_test_names(session_dir, session=None):
-    """Test functions this session ADDED, read from the end-state diffs.
+    """Test functions this session ADDED — from the end-state diffs for edits to
+    existing files, and from the CAS for files it created.
 
     Observing a node go red then green is not enough to call it the task: a broad
     run can mark tests red that are simply never run again (they did not turn
@@ -182,6 +230,9 @@ def _added_test_names(session_dir, session=None):
             except OSError:
                 continue
             names |= set(_ADDED_TEST_RE.findall(text))
+    # New files are recorded separately from edits; read both before deciding
+    # there is nothing to narrow on.
+    names |= _names_from_new_files(session_dir, session)
     if names or not session:
         return names
     start, end = session.get("base_sha_start"), session.get("base_sha_end")
