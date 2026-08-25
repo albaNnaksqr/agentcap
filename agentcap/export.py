@@ -53,7 +53,7 @@ _TIER = {"low": 0, "medium": 1, "high": 2}
 #     runtime is machine_local -- a pip freeze of it does not install. Bundles are
 #     clone-verified before being shipped.
 RECORD_VERSION = 5
-TASK_VERSION = 5
+TASK_VERSION = 6
 
 _SECRETS = [
     ("private_key", re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----')),
@@ -515,6 +515,13 @@ def _task_view(session, seed, val, steps, runs, repo, repo_source, cluster_name)
         # messages were skipped to find it
         "problem_statement_step": stmt_step,
         "fail_to_pass": seed["candidate_fail_to_pass"],
+        # How those nodes were arrived at. "observed" is a witnessed name-level
+        # red->green. "authored_after_collection_error" is weaker: the RED run
+        # died at collection and named no tests, so the nodes are the ones the
+        # session AUTHORED in a file that went error -> green. Shipped because a
+        # consumer that treats the two alike cannot tell a witnessed flip from an
+        # inferred one, and the inference is the part that could be wrong.
+        "fail_to_pass_source": seed.get("ftp_source"),
         "pass_to_pass": seed["candidate_pass_to_pass"],
         "test_files": seed["test_files"],
         "test_commands": list(dict.fromkeys(r["cmd"] for r in runs)),

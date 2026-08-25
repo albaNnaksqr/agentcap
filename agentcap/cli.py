@@ -33,6 +33,13 @@ def main(argv=None):
     ms.add_argument("repo")
     ms.add_argument("--agent", default="manual")
     ms.add_argument("--root", default=sess.DEFAULT_ROOT)
+    # The agent's OWN session id, when the harness gets to choose it (claude
+    # accepts `--session-id <uuid>`; codex does not). join reads this from
+    # extra.agent_session_id and it is the only signal that yields `high`
+    # confidence -- without it a harnessed capture tops out at `medium`, because
+    # cwd+time_overlap is all that is left to match on.
+    ms.add_argument("--agent-session-id", default=None,
+                    help="the agent's own session id, if the harness assigned it")
 
     me = sub.add_parser("mark-end", help="pin a session end + compute delta")
     me.add_argument("--repo", default=None)
@@ -91,7 +98,9 @@ def main(argv=None):
         print(json.dumps(report, indent=2))
         sys.exit(0 if ok else 1)
     elif a.cmd == "mark-start":
-        sid, s = sess.start_session(a.repo, agent=a.agent, confidence="high", root=a.root)
+        extra = {"agent_session_id": a.agent_session_id} if a.agent_session_id else None
+        sid, s = sess.start_session(a.repo, agent=a.agent, confidence="high", root=a.root,
+                                    extra=extra)
         print(json.dumps({"session_id": sid, "base_sha_start": s["base_sha_start"]}, indent=2))
     elif a.cmd == "mark-end":
         s, delta = sess.end_session(session_id=a.session_id, repo=a.repo,

@@ -35,7 +35,7 @@ they drift.
 stdlib only.
 """
 from __future__ import annotations
-import argparse, hashlib, json, os, subprocess, sys, time
+import argparse, hashlib, json, os, subprocess, sys, time, uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -228,7 +228,7 @@ def run_one(item: dict, args, contract: str, queue_dir: Path, logroot: Path) -> 
 
     if args.dry_run:
         rec["status"] = "dry_run"
-        print("  [dry-run] would create worktree, mark-start, codex exec, mark-end")
+        print("  [dry-run] would create worktree, mark-start, agent run, mark-end")
         return rec
 
     # 1. fresh worktree at clean base
@@ -239,8 +239,16 @@ def run_one(item: dict, args, contract: str, queue_dir: Path, logroot: Path) -> 
     rec["base_sha"] = sh(["git", "-C", str(wt), "rev-parse", "HEAD"]).stdout.strip()
 
     # 2. mark-start BEFORE any edit
-    ms = sh(["python3", "-m", "agentcap", "mark-start", str(wt), "--agent", "codex"],
-            env=agentcap_env(args))
+    #
+    # claude lets the harness choose the agent's own session id; codex does not.
+    # When we can choose it, hand it to mark-start so join can match on it
+    # directly -- that is the difference between `high` and `medium` confidence,
+    # and `benchmark_eligible` requires `high`.
+    agent_sid = str(uuid.uuid4()) if args.agent == "claude" else None
+    ms_cmd = ["python3", "-m", "agentcap", "mark-start", str(wt), "--agent", args.agent]
+    if agent_sid:
+        ms_cmd += ["--agent-session-id", agent_sid]
+    ms = sh(ms_cmd, env=agentcap_env(args))
     if ms.returncode != 0:
         rec["status"] = "mark_start_failed"; rec["error"] = ms.stderr.strip()
         print("  ! mark-start failed:", ms.stderr.strip()); return rec
@@ -250,20 +258,34 @@ def run_one(item: dict, args, contract: str, queue_dir: Path, logroot: Path) -> 
         rec["status"] = "mark_start_parse_failed"; rec["raw"] = ms.stdout
         print("  ! could not parse mark-start output"); return rec
     rec["session_id"] = sid
-    print(f"  mark-start ok  session_id={sid}")
+    rec["agent_session_id"] = agent_sid
+    print(f"  mark-start ok  session_id={sid}"
+          + (f"  agent_session_id={agent_sid}" if agent_sid else ""))
 
     # 3. codex exec — Layer 2, codex owns everything here
     pack = issue_pack(item, queue_dir)
     prompt = compose_prompt(contract, pack) + docker_block(item, wt, args)
     (logdir / "prompt.md").write_text(prompt)
-    cmd = ["codex", "exec", "-C", str(wt), "-o", str(logdir / "last_message.txt")]
-    if args.bypass_sandbox:
-        cmd.append("--dangerously-bypass-approvals-and-sandbox")
-    if args.model:
-        cmd += ["-m", args.model]
-    if args.reasoning:
-        cmd += ["-c", f"model_reasoning_effort={args.reasoning}"]
-    cmd.append("-")  # read prompt from stdin
+    if args.agent == "claude":
+        # A real, separate `claude` process -- NOT an in-conversation subagent.
+        # That distinction is the whole point: a subagent leaves no transcript of
+        # its own, so join has nothing to attach and the capture is unusable. A
+        # forked CLI writes its own ~/.claude/projects/<slug>/<uuid>.jsonl.
+        # cwd is the worktree so the transcript's cwd passes join's cwd gate.
+        cmd = ["claude", "-p", "--session-id", agent_sid]
+        if args.bypass_sandbox:
+            cmd.append("--dangerously-skip-permissions")
+        if args.model:
+            cmd += ["--model", args.model]
+    else:
+        cmd = ["codex", "exec", "-C", str(wt), "-o", str(logdir / "last_message.txt")]
+        if args.bypass_sandbox:
+            cmd.append("--dangerously-bypass-approvals-and-sandbox")
+        if args.model:
+            cmd += ["-m", args.model]
+        if args.reasoning:
+            cmd += ["-c", f"model_reasoning_effort={args.reasoning}"]
+        cmd.append("-")  # read prompt from stdin
     # optional: put a prebuilt venv on PATH so codex's `python`/`pytest` resolve to an
     # interpreter where the target repo + its test deps are installed (Track-A repos).
     cx_env = None
@@ -276,8 +298,9 @@ def run_one(item: dict, args, contract: str, queue_dir: Path, logroot: Path) -> 
     t0 = time.time()
     try:
         cx = subprocess.run(cmd, input=prompt, text=True, timeout=args.timeout, env=cx_env,
-                            stdout=open(logdir / "codex.stdout", "w"),
-                            stderr=open(logdir / "codex.stderr", "w"))
+                            cwd=str(wt) if args.agent == "claude" else None,
+                            stdout=open(logdir / f"{args.agent}.stdout", "w"),
+                            stderr=open(logdir / f"{args.agent}.stderr", "w"))
         rec["codex_exit"] = cx.returncode
         rec["codex_timed_out"] = False
     except subprocess.TimeoutExpired:
@@ -332,7 +355,11 @@ def main():
                          "source, and a script-relative default would quietly fill the repo")
     ap.add_argument("--default-base", default="main", help="base ref if a queue item omits it")
     ap.add_argument("--timeout", type=int, default=1800, help="per-issue codex timeout (s)")
-    ap.add_argument("--model", default=None, help="pass to codex -m (optional)")
+    ap.add_argument("--model", default=None, help="pass to the agent's model flag (optional)")
+    ap.add_argument("--agent", default="codex", choices=("codex", "claude"),
+                    help="which coding agent runs the pack. Both are launched as separate "
+                         "OS processes; claude additionally gets its session id assigned "
+                         "by the harness, which lifts join confidence to `high`.")
     ap.add_argument("--venv", default=None,
                     help="prebuilt venv whose bin/ is prepended to PATH for the codex step "
                          "(so python/pytest resolve to the repo's installed env)")

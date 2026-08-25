@@ -187,6 +187,29 @@ def _names_from_new_files(session_dir, session):
     return names
 
 
+def _test_funcs_in(session_dir, rel, session=None):
+    """Test functions defined in ONE file, read out of env_end via the CAS.
+
+    `_names_from_new_files` answers "which names did this session author" across
+    every added file at once. The collection-error promotion needs the per-file
+    answer, because it builds `path::name` node ids and must not attach a name to
+    a file that does not define it."""
+    man = _load_json(os.path.join(session_dir, "env_end", "manifest.json")) or {}
+    ent = next((e for e in man.get("entries", []) if e.get("path") == rel), None)
+    if not ent or ent.get("status") != "present" or not ent.get("content_hash"):
+        return set()
+    sess_json = session or _load_json(os.path.join(session_dir, "session.json")) or {}
+    cas = sess_json.get("cas_root")
+    if not cas:
+        return set()
+    h = ent["content_hash"]
+    try:
+        text = open(os.path.join(cas, h[:2], h[2:]), "rb").read().decode(errors="ignore")
+    except OSError:
+        return set()
+    return set(_TEST_DEF_RE.findall(text))
+
+
 def _load_json(path):
     try:
         with open(path) as f:
@@ -313,15 +336,69 @@ def extract_seed(session_dir):
     if authored:
         ftp = authored
 
+    # E. the collection-error case: an empty ftp that is a measurement artefact,
+    # not an absence of red->green.
+    #
+    # `_timeline` can only see a flip when the RED run NAMES the tests that
+    # failed. A run that dies at collection names none -- pytest reports
+    # `error: N` for the file and no per-test ids. That is precisely what a
+    # test-first session looks like when the module under test does not exist
+    # yet: the first run is an ImportError at collection, so ftp is
+    # structurally always empty and replay can only ever answer
+    # `no_runnable_tests`. The whole "write a new module, then test it" shape was
+    # therefore unverifiable by construction.
+    #
+    # Found on claude-litellm-38026: 6 authored tests, evidence idx6 `error: 2`
+    # -> idx27 `passed: 6`, and candidate_fail_to_pass came out [].
+    #
+    # Promoted only under all of: nothing observed at name level, the session
+    # AUTHORED the names, an earlier run carried failures or errors, the last run
+    # is green, and every promoted name resolves to a file present in env_end.
+    # The provenance is recorded rather than blended in, because this is a weaker
+    # claim than a witnessed name-level flip and a consumer must be able to tell.
+    ftp_source = "observed" if ftp else None
+    if not ftp and added_tests and evidence:
+        # The LAST run that says anything -- not the literal last one. A run whose
+        # output carries no counts is no evidence, and both agents truncate long
+        # tails often enough that reading evidence[-1] verbatim decides on silence.
+        # value.ended_green already walks back like this; taskseed did not, and on
+        # claude-litellm-38026 the final two runs were empty so the promotion below
+        # never fired despite idx27 reporting `passed: 6`.
+        idx_last = next((i for i in range(len(evidence) - 1, -1, -1)
+                         if evidence[i]["counts"]), None)
+        last_counts = evidence[idx_last]["counts"] if idx_last is not None else {}
+        green_last = (last_counts.get("failed", 0) == 0
+                      and last_counts.get("error", 0) == 0
+                      and last_counts.get("passed", 0) > 0)
+        red_before = any(e["counts"].get("failed", 0) or e["counts"].get("error", 0)
+                         for e in evidence[:idx_last or 0])
+        if green_last and red_before:
+            new_test_files = [c for c in (set(delta["added"]) | set(delta["modified"]))
+                              if _looks_test(c) and c in end_paths]
+            promoted = {"%s::%s" % (f, n) for f in new_test_files for n in added_tests
+                        if n in _test_funcs_in(session_dir, f)}
+            if promoted:
+                ftp = promoted
+                node_paths.update({n: n.split("::", 1)[0] for n in promoted})
+                ftp_source = "authored_after_collection_error"
+
     changed = sorted(set(delta["added"]) | set(delta["modified"]))
     test_files = sorted({node_paths[n] for n in (ftp | ptp)}
                         | {c for c in changed if _looks_test(c)})
     source_delta = [c for c in changed if not _looks_test(c)]
     test_only = bool(changed) and not source_delta
 
-    # counts-only evidence: failures seen earlier, zero in the last run
-    counts_only = bool(evidence) and evidence[-1]["counts"].get("failed", 0) == 0 \
-        and any(e["counts"].get("failed", 0) for e in evidence)
+    # counts-only evidence: failures seen earlier, zero in the last run.
+    # `error` counts as red alongside `failed`: a collection error is not a pass,
+    # and for a test-first session it is the ONLY red there is. Looking at
+    # `failed` alone made claude-litellm-38026 survive by accident -- its real red
+    # was `error: 2`, and it only got a seed because unrelated mutation-testing
+    # runs later happened to produce `failed: 18`.
+    def _red(c):
+        return c.get("failed", 0) or c.get("error", 0)
+    _spoken = [e for e in evidence if e["counts"]]
+    counts_only = bool(_spoken) and _red(_spoken[-1]["counts"]) == 0 \
+        and any(_red(e["counts"]) for e in _spoken)
     if not ftp and not counts_only:
         return None
 
@@ -356,6 +433,9 @@ def extract_seed(session_dir):
         # transparency for the narrowing above: what the session wrote, and which
         # merely-observed flips were set aside because of it
         "authored_tests": sorted(added_tests),
+        # "observed" = a witnessed name-level red->green. Anything else is a
+        # weaker claim and is named so a consumer can refuse it.
+        "ftp_source": ftp_source,
         "dropped_observed_ftp": dropped_observed,
         "evidence": evidence,
         "verified": False,   # we did not run anything — observed evidence only
